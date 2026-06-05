@@ -5,7 +5,7 @@
 
 import clsx from "clsx";
 import { SignalType } from "../utils/types";
-import { formatPrice, fmt, formatPct } from "../utils/format";
+import { formatPrice, fmt } from "../utils/format";
 import { Signal } from "../utils/types";
 
 interface SignalBadgeProps {
