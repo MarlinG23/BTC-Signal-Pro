@@ -10,7 +10,7 @@
  *   REST API  → initial signal history, news history, alert history (polled every 30s)
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useApi } from "../hooks/useApi";
 import {

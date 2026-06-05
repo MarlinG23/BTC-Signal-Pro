@@ -5,7 +5,7 @@
 
 import { useState } from "react";
 import clsx from "clsx";
-import { PlayCircle, TrendingUp, TrendingDown } from "lucide-react";
+import { PlayCircle, TrendingUp } from "lucide-react";
 import { BacktestResult } from "../utils/types";
 import { fmt, formatPct } from "../utils/format";
 

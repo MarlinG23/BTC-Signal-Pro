@@ -33,7 +33,7 @@ export function PriceHeader({ price, connected, candles }: PriceHeaderProps) {
           <Activity className="w-4 h-4 text-brand-green" />
           <span
             className={clsx(
-              "text-3xl font-bold font-mono transition-all duration-300",
+              "text-2xl sm:text-3xl font-bold font-mono transition-all duration-300",
               price ? "text-white" : "text-brand-muted"
             )}
           >
