@@ -70,6 +70,11 @@ class BinanceWebSocketClient:
     def latest_price(self) -> Optional[float]:
         return self._latest_price
 
+    def update_latest_price(self, price: float) -> None:
+        """Update the cached price (used by REST fallback when Binance is unavailable)."""
+        self._latest_price = price
+        self._latest_price_time = time.time()
+
     async def run(self) -> None:
         """
         Start the WebSocket connection loop.  Reconnects indefinitely with
