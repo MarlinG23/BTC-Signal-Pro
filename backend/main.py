@@ -77,6 +77,9 @@ async def lifespan(app: FastAPI):
     # 4. Start news polling (every 5 minutes)
     news_task = asyncio.create_task(_news_poll_loop(), name="news-poll")
 
+    # 5. Start REST price fallback when Binance WebSocket is geo-blocked/unavailable
+    fallback_task = asyncio.create_task(_price_fallback_loop(), name="price-fallback")
+
     logger.info("BTC Signal Pro ready. Listening on %s:%d", settings.APP_HOST, settings.APP_PORT)
 
     yield  # application runs here
@@ -86,8 +89,9 @@ async def lifespan(app: FastAPI):
     await binance_ws.stop()
     ws_task.cancel()
     news_task.cancel()
+    fallback_task.cancel()
     try:
-        await asyncio.gather(ws_task, news_task, return_exceptions=True)
+        await asyncio.gather(ws_task, news_task, fallback_task, return_exceptions=True)
     except Exception:
         pass
     logger.info("Shutdown complete.")
@@ -370,6 +374,30 @@ async def _on_price_tick(data: dict) -> None:
             )
     except Exception as exc:
         logger.debug("Price tick broadcast error: %s", exc)
+
+
+async def _price_fallback_loop() -> None:
+    """Poll Coinbase spot price every 10s when Binance WebSocket is geo-blocked."""
+    import httpx
+
+    while True:
+        try:
+            await asyncio.sleep(10)
+            if binance_ws.latest_price is not None:
+                continue
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get("https://api.coinbase.com/v2/prices/BTC-USD/spot")
+                resp.raise_for_status()
+                price = float(resp.json()["data"]["amount"])
+            binance_ws.update_latest_price(price)
+            await alert_manager.ws_broadcaster.broadcast(
+                {"type": "price_tick", "price": price, "source": "coinbase_fallback"}
+            )
+            logger.info("Price fallback delivered BTC/USD: %.2f", price)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.debug("Price fallback poll failed: %s", exc)
 
 
 async def _news_poll_loop() -> None:
