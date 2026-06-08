@@ -44,7 +44,11 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     APP_PORT: int = 8000
     APP_HOST: str = "0.0.0.0"
-    CORS_ORIGINS: str = "http://localhost:3000"
+    # Comma-separated list of allowed CORS origins.
+    # Defaults to "*" so Railway split-service deployments work without
+    # manual configuration.  Set an explicit value in production to lock
+    # this down (e.g. "https://frontend-production-9f903.up.railway.app").
+    CORS_ORIGINS: str = "*"
 
     # ── Signal thresholds ─────────────────────────────────────────────────
     SIGNAL_CONFIDENCE_THRESHOLD: float = 70.0
@@ -63,7 +67,13 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> List[str]:
-        """Parse CORS_ORIGINS comma-separated string into a list."""
+        """Parse CORS_ORIGINS comma-separated string into a list.
+
+        A value of "*" is returned as-is so FastAPI's CORSMiddleware
+        accepts requests from any origin.
+        """
+        if self.CORS_ORIGINS.strip() == "*":
+            return ["*"]
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
 
     @property

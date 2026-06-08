@@ -52,6 +52,10 @@ fake_news_filter = FakeNewsFilter()
 # Key support/resistance levels (updated periodically via REST endpoint)
 _key_levels: list[float] = []
 
+# Latest Fear & Greed snapshot — updated by the news poll loop so the REST
+# endpoint can serve it immediately without making an outbound request.
+_latest_fear_greed: Optional[dict] = None
+
 
 # ── Application lifespan ──────────────────────────────────────────────────────
 
@@ -136,6 +140,34 @@ async def get_indicators():
     if snap is None:
         raise HTTPException(status_code=503, detail="No indicator data yet. Warming up.")
     return _snapshot_to_dict(snap)
+
+
+@app.get("/api/fear-greed")
+async def get_fear_greed():
+    """Return the latest Fear & Greed index value.
+
+    Served from an in-memory cache that is populated on the first news poll
+    cycle (at startup).  Returns 503 while the cache is still empty.
+    """
+    if _latest_fear_greed is None:
+        # Cache miss — fetch live so the first page load never shows a spinner
+        try:
+            async with NewsFetcher() as fetcher:
+                fg = await fetcher.fetch_fear_greed()
+            if fg is None:
+                raise HTTPException(status_code=503, detail="Fear & Greed data not yet available.")
+            global _latest_fear_greed
+            _latest_fear_greed = {
+                "value": fg.value,
+                "classification": fg.classification,
+                "timestamp": fg.timestamp.isoformat(),
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("Fear & Greed live fetch failed: %s", exc)
+            raise HTTPException(status_code=503, detail="Fear & Greed data not yet available.")
+    return _latest_fear_greed
 
 
 @app.get("/api/signals/latest")
@@ -401,11 +433,15 @@ async def _price_fallback_loop() -> None:
 
 
 async def _news_poll_loop() -> None:
-    """Background loop: fetch news every 5 minutes and process it."""
+    """Background loop: fetch news every 5 minutes and process it.
+
+    Runs immediately on startup so Fear & Greed and news are available
+    as soon as the first client connects.
+    """
     while True:
         try:
-            await asyncio.sleep(300)  # 5 minutes
             await _fetch_and_process_news()
+            await asyncio.sleep(300)  # 5 minutes
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -501,15 +537,16 @@ async def _fetch_and_process_news() -> None:
                 short_usd=liquidations.short_liquidations_usd,
             )
 
-        # Broadcast Fear & Greed
+        # Cache and broadcast Fear & Greed
         if fear_greed:
+            global _latest_fear_greed
+            _latest_fear_greed = {
+                "value": fear_greed.value,
+                "classification": fear_greed.classification,
+                "timestamp": fear_greed.timestamp.isoformat(),
+            }
             await alert_manager.ws_broadcaster.broadcast(
-                {
-                    "type": "fear_greed",
-                    "value": fear_greed.value,
-                    "classification": fear_greed.classification,
-                    "timestamp": fear_greed.timestamp.isoformat(),
-                }
+                {"type": "fear_greed", **_latest_fear_greed}
             )
 
     except Exception as exc:

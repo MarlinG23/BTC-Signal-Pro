@@ -72,6 +72,11 @@ export function Dashboard() {
     "/api/alerts/history?limit=50",
     30_000
   );
+  // Fetch Fear & Greed immediately on page load; WS updates will override
+  const { data: initialFearGreed } = useApi<FearGreedData>(
+    "/api/fear-greed",
+    300_000 // refresh every 5 minutes to stay in sync with backend poll
+  );
 
   const nextAlertId = useRef(0);
   const nextNewsId = useRef(-1);
@@ -209,8 +214,8 @@ export function Dashboard() {
 
           {/* Right column */}
           <div className="space-y-4">
-            {/* Fear & Greed */}
-            <FearGreedGauge data={fearGreed} />
+            {/* Fear & Greed — live WS takes priority; REST fills in on load */}
+            <FearGreedGauge data={fearGreed ?? initialFearGreed ?? null} />
 
             {/* Alert Log */}
             <AlertLog alerts={allAlerts} />
