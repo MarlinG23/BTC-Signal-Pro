@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/btc_signals"
 
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def fix_database_url(cls, v: str) -> str:
+        """Railway injects postgresql:// — rewrite to postgresql+asyncpg://."""
+        if v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        if v.startswith("postgres://"):
+            return v.replace("postgres://", "postgresql+asyncpg://", 1)
+        return v
+
     # ── Binance ───────────────────────────────────────────────────────────
     BINANCE_API_KEY: str = ""
     BINANCE_API_SECRET: str = ""
