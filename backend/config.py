@@ -26,11 +26,32 @@ class Settings(BaseSettings):
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
     def fix_database_url(cls, v: str) -> str:
-        """Railway injects postgresql:// — rewrite to postgresql+asyncpg://."""
-        if v.startswith("postgresql://"):
-            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        """Normalise DATABASE_URL for SQLAlchemy asyncpg.
+
+        Railway injects postgres:// or postgresql://.
+        Railway internal hostnames (*.railway.internal) do not use SSL —
+        asyncpg's default SSL negotiation raises TargetServerAttributeNotMatched
+        against them, so we explicitly disable SSL for internal URLs.
+        """
+        import re
+
         if v.startswith("postgres://"):
-            return v.replace("postgres://", "postgresql+asyncpg://", 1)
+            v = v.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif v.startswith("postgresql://"):
+            v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+        # Strip any existing ssl/sslmode query params so we control them
+        v = re.sub(r"[?&]sslmode=[^&]*", "", v)
+        v = re.sub(r"[?&]ssl=[^&]*", "", v)
+        # Clean up dangling ? or & left after stripping
+        v = re.sub(r"\?&", "?", v)
+        v = re.sub(r"[?&]$", "", v)
+
+        # Railway internal networking doesn't support SSL
+        if "railway.internal" in v:
+            sep = "&" if "?" in v else "?"
+            v = f"{v}{sep}ssl=false"
+
         return v
 
     # ── Binance ───────────────────────────────────────────────────────────
