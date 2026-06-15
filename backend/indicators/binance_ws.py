@@ -31,7 +31,13 @@ logger = logging.getLogger(__name__)
 WS_BASE = "wss://stream.binance.us:9443/stream"
 WS_BASE_COM = "wss://stream.binance.com:9443/stream"
 WS_BASE_TESTNET = "wss://testnet.binance.vision/stream"
+
+# REST endpoints for historical candle preload
+REST_BASE_US = "https://api.binance.us"
+REST_BASE_COM = "https://api.binance.com"
+
 SYMBOL = "btcusdt"
+SYMBOL_UPPER = "BTCUSDT"
 
 # Back-off config
 INITIAL_BACKOFF_S = 1
@@ -78,6 +84,62 @@ class BinanceWebSocketClient:
         self._latest_price = price
         self._latest_price_time = time.time()
 
+    async def preload_historical_candles(self, limit: int = 50) -> int:
+        """Fetch the last `limit` closed 1-minute candles from Binance REST API
+        and push them into the calculator so indicators are ready before the
+        WebSocket delivers the first live candle.
+
+        Tries binance.us first (not geo-blocked on Railway US West), then
+        falls back to binance.com.  Returns the number of candles loaded.
+        """
+        import httpx
+
+        endpoints = (
+            [REST_BASE_US, REST_BASE_COM]
+            if settings.BINANCE_USE_US_ENDPOINT
+            else [REST_BASE_COM, REST_BASE_US]
+        )
+        params = {
+            "symbol": SYMBOL_UPPER,
+            "interval": "1m",
+            "limit": limit,
+        }
+
+        for base in endpoints:
+            url = f"{base}/api/v3/klines"
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.get(url, params=params)
+                    resp.raise_for_status()
+                    klines = resp.json()
+
+                count = 0
+                for k in klines[:-1]:  # skip the current unclosed candle
+                    candle = Candle(
+                        timestamp=pd.Timestamp(k[0], unit="ms", tz="UTC"),
+                        open=float(k[1]),
+                        high=float(k[2]),
+                        low=float(k[3]),
+                        close=float(k[4]),
+                        volume=float(k[5]),
+                    )
+                    self._calculator.push_candle(candle)
+                    # Update latest price from historical data
+                    self._latest_price = float(k[4])
+                    count += 1
+
+                logger.info(
+                    "Preloaded %d historical candles from %s — indicators ready",
+                    count, base,
+                )
+                return count
+
+            except Exception as exc:
+                logger.warning("Historical preload failed from %s: %s", base, exc)
+
+        logger.warning("Could not preload historical candles from any endpoint")
+        return 0
+
     async def run(self) -> None:
         """
         Start the WebSocket connection loop.  Reconnects indefinitely with
@@ -86,6 +148,10 @@ class BinanceWebSocketClient:
         self._running = True
         backoff = INITIAL_BACKOFF_S
         attempt = 0
+
+        # Preload historical candles once so indicators are warm before
+        # the first live candle arrives via WebSocket.
+        await self.preload_historical_candles(limit=50)
 
         while self._running:
             attempt += 1
