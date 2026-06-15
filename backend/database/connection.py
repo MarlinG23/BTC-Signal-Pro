@@ -17,14 +17,35 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _ssl_connect_args(database_url: str) -> dict:
+    """Return asyncpg connect_args with the right SSL setting.
+
+    Railway Postgres URLs — both the public TCP proxy (*.rlwy.net) and the
+    private network (*.railway.internal) — do not require SSL and raise
+    TargetServerAttributeNotMatched when asyncpg attempts SSL negotiation.
+    We disable SSL for all known Railway hostnames so connections succeed.
+    """
+    railway_patterns = (
+        ".rlwy.net",        # public TCP proxy  e.g. monorail.proxy.rlwy.net
+        "railway.internal", # private network   e.g. postgres.railway.internal
+        "railway.app",      # legacy public domains
+    )
+    for pattern in railway_patterns:
+        if pattern in database_url:
+            logger.debug("Railway host detected — disabling SSL for DB connection")
+            return {"ssl": False}
+    return {}
+
+
 # NullPool is appropriate for serverless / Railway deployments where the
-# process may be recycled frequently.  Switch to AsyncAdaptedQueuePool
-# (the default) for long-running servers with many concurrent requests.
+# process may be recycled frequently.
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.APP_ENV == "development",
     pool_pre_ping=True,
     poolclass=NullPool,
+    connect_args=_ssl_connect_args(settings.DATABASE_URL),
 )
 
 AsyncSessionLocal = async_sessionmaker(
