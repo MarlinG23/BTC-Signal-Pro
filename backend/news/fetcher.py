@@ -26,14 +26,17 @@ logger = logging.getLogger(__name__)
 
 # Source identifiers
 SOURCE_COINDESK = "coindesk"
-SOURCE_REUTERS = "reuters"
+SOURCE_COINTELEGRAPH = "cointelegraph"
+SOURCE_BITCOIN_MAGAZINE = "bitcoin_magazine"
 SOURCE_FEAR_GREED = "fear_greed"
 SOURCE_GLASSNODE = "glassnode"
 SOURCE_COINGLASS = "coinglass"
 
-# RSS feed URLs
+# RSS feed URLs — Reuters removed (requires auth / 401), replaced with
+# CoinTelegraph and Bitcoin Magazine which return 200 with full content
 COINDESK_RSS = "https://www.coindesk.com/arc/outboundfeeds/rss/"
-REUTERS_RSS = "https://feeds.reuters.com/reuters/businessNews"
+COINTELEGRAPH_RSS = "https://cointelegraph.com/rss"
+BITCOIN_MAGAZINE_RSS = "https://bitcoinmagazine.com/feed"
 
 # REST API URLs
 FEAR_GREED_API = "https://api.alternative.me/fng/?limit=1&format=json"
@@ -101,13 +104,13 @@ class NewsFetcher:
 
     async def fetch_all_news(self) -> list[RawArticle]:
         """
-        Fetch articles from CoinDesk and Reuters concurrently.
-
-        Returns a deduplicated, combined list sorted by publication date.
+        Fetch articles from CoinDesk, CoinTelegraph, and Bitcoin Magazine
+        concurrently.  Returns a deduplicated list sorted newest-first.
         """
         results = await asyncio.gather(
             self.fetch_coindesk(),
-            self.fetch_reuters(),
+            self.fetch_cointelegraph(),
+            self.fetch_bitcoin_magazine(),
             return_exceptions=True,
         )
 
@@ -137,9 +140,13 @@ class NewsFetcher:
         """Fetch latest headlines from CoinDesk RSS feed."""
         return await self._fetch_rss(SOURCE_COINDESK, COINDESK_RSS)
 
-    async def fetch_reuters(self) -> list[RawArticle]:
-        """Fetch latest headlines from Reuters Business RSS feed."""
-        return await self._fetch_rss(SOURCE_REUTERS, REUTERS_RSS)
+    async def fetch_cointelegraph(self) -> list[RawArticle]:
+        """Fetch latest headlines from CoinTelegraph RSS feed."""
+        return await self._fetch_rss(SOURCE_COINTELEGRAPH, COINTELEGRAPH_RSS)
+
+    async def fetch_bitcoin_magazine(self) -> list[RawArticle]:
+        """Fetch latest headlines from Bitcoin Magazine RSS feed."""
+        return await self._fetch_rss(SOURCE_BITCOIN_MAGAZINE, BITCOIN_MAGAZINE_RSS)
 
     async def fetch_fear_greed(self) -> Optional[FearGreedData]:
         """
