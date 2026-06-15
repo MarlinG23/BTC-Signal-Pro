@@ -68,8 +68,9 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = "*"
 
     # ── Signal thresholds ─────────────────────────────────────────────────
-    SIGNAL_CONFIDENCE_THRESHOLD: float = 70.0
-    SIGNAL_MIN_INDICATORS: int = 3
+    SIGNAL_CONFIDENCE_THRESHOLD: float = 60.0   # lowered from 70 → fires sooner
+    SIGNAL_MIN_INDICATORS: int = 2              # lowered from 3 → only 2 indicators needed
+    SIGNAL_MIN_CANDLES: int = 3                 # skip evaluation entirely below this
 
     # ── Alert thresholds ─────────────────────────────────────────────────
     LIQUIDATION_ALERT_THRESHOLD_M: float = 500.0

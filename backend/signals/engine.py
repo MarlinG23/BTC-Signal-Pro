@@ -109,17 +109,25 @@ class SignalEngine:
     def __init__(self) -> None:
         self._threshold = settings.SIGNAL_CONFIDENCE_THRESHOLD
         self._min_indicators = settings.SIGNAL_MIN_INDICATORS
+        self._min_candles = settings.SIGNAL_MIN_CANDLES
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def evaluate(self, snapshot: IndicatorSnapshot) -> Optional[SignalResult]:
+    def evaluate(
+        self, snapshot: IndicatorSnapshot, candle_count: int = 999
+    ) -> Optional[SignalResult]:
         """
         Evaluate an indicator snapshot.
 
         Returns a SignalResult if a tradeable signal is detected above the
         confidence threshold, otherwise returns None.
+
+        candle_count: number of candles in the rolling window — evaluation
+        is skipped below SIGNAL_MIN_CANDLES to avoid noise on cold start.
         """
         if snapshot.close_price is None:
+            return None
+        if candle_count < self._min_candles:
             return None
 
         try:

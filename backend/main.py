@@ -377,8 +377,8 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
     # Persist to DB
     await _persist_candle(candle, snapshot)
 
-    # Run signal engine
-    signal = signal_engine.evaluate(snapshot)
+    # Run signal engine — pass candle count so it can skip noisy early candles
+    signal = signal_engine.evaluate(snapshot, candle_count=calculator.candle_count())
     if signal:
         signal_id = await _persist_signal(signal)
         await alert_manager.fire_signal_alert(signal)
