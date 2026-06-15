@@ -149,6 +149,7 @@ async def get_fear_greed():
     Served from an in-memory cache that is populated on the first news poll
     cycle (at startup).  Returns 503 while the cache is still empty.
     """
+    global _latest_fear_greed  # must be declared before any use in this scope
     if _latest_fear_greed is None:
         # Cache miss — fetch live so the first page load never shows a spinner
         try:
@@ -156,7 +157,6 @@ async def get_fear_greed():
                 fg = await fetcher.fetch_fear_greed()
             if fg is None:
                 raise HTTPException(status_code=503, detail="Fear & Greed data not yet available.")
-            global _latest_fear_greed
             _latest_fear_greed = {
                 "value": fg.value,
                 "classification": fg.classification,
