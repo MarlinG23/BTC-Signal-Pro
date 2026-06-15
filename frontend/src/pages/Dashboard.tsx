@@ -25,6 +25,7 @@ import {
 import { PriceHeader } from "../components/PriceHeader";
 import { SignalBadge } from "../components/SignalBadge";
 import { IndicatorsPanel } from "../components/IndicatorsPanel";
+import { TrendPanel } from "../components/TrendPanel";
 import { FearGreedGauge } from "../components/FearGreedGauge";
 import { NewsFeed } from "../components/NewsFeed";
 import { AlertLog } from "../components/AlertLog";
@@ -199,7 +200,10 @@ export function Dashboard() {
             {/* Signal Badge — most prominent element */}
             <SignalBadge signal={displaySignal} />
 
-            {/* Indicators */}
+            {/* Multi-timeframe: TREND (4H) vs ENTRY (1M) */}
+            <TrendPanel snapshot1m={indicators} />
+
+            {/* 1M Indicators detail */}
             <IndicatorsPanel snapshot={indicators} />
 
             {/* Signal History */}

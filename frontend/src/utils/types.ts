@@ -73,6 +73,17 @@ export interface FearGreedData {
   timestamp: string;
 }
 
+export interface TrendSignal {
+  direction: 1 | -1 | 0;        // +1 bullish, -1 bearish, 0 neutral
+  label: "BULLISH" | "BEARISH" | "NEUTRAL" | "LOADING";
+  ema_20: number | null;
+  ema_50: number | null;
+  ema_200: number | null;
+  rsi_14: number | null;
+  close_price: number | null;
+  candles_buffered: number;
+}
+
 export interface BacktestResult {
   total_signals: number;
   total_trades: number;
