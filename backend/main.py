@@ -663,7 +663,18 @@ async def _fetch_and_process_news() -> None:
                         is_filtered=news_item.is_filtered,
                         cross_referenced=news_item.cross_referenced,
                     )
-                    .on_conflict_do_nothing(index_elements=["url"])
+                    .on_conflict_do_update(
+                        index_elements=["url"],
+                        set_={
+                            # Re-evaluate filter decision on every fetch so
+                            # articles previously blocked as unverified can
+                            # be unblocked when the filter logic improves.
+                            "is_filtered": news_item.is_filtered,
+                            "cross_referenced": news_item.cross_referenced,
+                            "sentiment": news_item.sentiment,
+                            "sentiment_score": news_item.sentiment_score,
+                        },
+                    )
                 )
                 await session.execute(stmt)
 
