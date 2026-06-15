@@ -84,6 +84,9 @@ async def lifespan(app: FastAPI):
     # 5. Start REST price fallback when Binance WebSocket is geo-blocked/unavailable
     fallback_task = asyncio.create_task(_price_fallback_loop(), name="price-fallback")
 
+    # 6. Start signal outcome checker (runs every 5 minutes)
+    outcome_task = asyncio.create_task(_outcome_check_loop(), name="outcome-check")
+
     logger.info("BTC Signal Pro ready. Listening on %s:%d", settings.APP_HOST, settings.APP_PORT)
 
     yield  # application runs here
@@ -94,8 +97,9 @@ async def lifespan(app: FastAPI):
     ws_task.cancel()
     news_task.cancel()
     fallback_task.cancel()
+    outcome_task.cancel()
     try:
-        await asyncio.gather(ws_task, news_task, fallback_task, return_exceptions=True)
+        await asyncio.gather(ws_task, news_task, fallback_task, outcome_task, return_exceptions=True)
     except Exception:
         pass
     logger.info("Shutdown complete.")
@@ -168,6 +172,50 @@ async def get_fear_greed():
             logger.error("Fear & Greed live fetch failed: %s", exc)
             raise HTTPException(status_code=503, detail="Fear & Greed data not yet available.")
     return _latest_fear_greed
+
+
+@app.get("/api/signals/stats")
+async def get_signal_stats(db: AsyncSession = Depends(get_db)):
+    """Return win rate and outcome statistics for all resolved signals."""
+    try:
+        from sqlalchemy import select, func as sqlfunc
+
+        result = await db.execute(
+            select(
+                Signal.outcome,
+                sqlfunc.count(Signal.id).label("count"),
+                sqlfunc.avg(Signal.pnl_percent).label("avg_pnl"),
+            )
+            .where(Signal.outcome.isnot(None))
+            .group_by(Signal.outcome)
+        )
+        rows = result.all()
+
+        stats: dict = {"wins": 0, "losses": 0, "open": 0, "win_rate_pct": 0.0, "avg_pnl_pct": 0.0}
+        total_pnl = 0.0
+        pnl_count = 0
+        for row in rows:
+            outcome, count, avg_pnl = row
+            if outcome == "WIN":
+                stats["wins"] = count
+            elif outcome == "LOSS":
+                stats["losses"] = count
+            elif outcome == "OPEN":
+                stats["open"] = count
+            if avg_pnl is not None:
+                total_pnl += float(avg_pnl) * count
+                pnl_count += count
+
+        decided = stats["wins"] + stats["losses"]
+        if decided > 0:
+            stats["win_rate_pct"] = round(stats["wins"] / decided * 100, 1)
+        if pnl_count > 0:
+            stats["avg_pnl_pct"] = round(total_pnl / pnl_count, 2)
+
+        return stats
+    except Exception as exc:
+        logger.error("Failed to fetch signal stats: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch signal stats.")
 
 
 @app.get("/api/signals/latest")
@@ -430,6 +478,120 @@ async def _price_fallback_loop() -> None:
             break
         except Exception as exc:
             logger.debug("Price fallback poll failed: %s", exc)
+
+
+async def _outcome_check_loop() -> None:
+    """Background loop: every 5 minutes resolve WIN/LOSS for signals older than 4 hours."""
+    while True:
+        try:
+            await _resolve_signal_outcomes()
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("Outcome check loop error: %s", exc)
+            await asyncio.sleep(60)
+
+
+async def _resolve_signal_outcomes() -> None:
+    """
+    For each signal with no outcome that was generated >= 4 hours ago,
+    scan the stored candles to see if TP or SL was hit first.
+
+    BUY/STRONG_BUY: WIN if any candle.high >= take_profit
+                    LOSS if any candle.low  <= stop_loss
+    SELL/STRONG_SELL: WIN if any candle.low  <= take_profit
+                      LOSS if any candle.high >= stop_loss
+
+    If neither level was touched in 4 hours → mark OPEN (timed out).
+    """
+    from datetime import timedelta
+    from sqlalchemy import select, and_
+
+    EVALUATION_WINDOW_H = 4
+
+    try:
+        async with AsyncSessionLocal() as session:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=EVALUATION_WINDOW_H)
+            result = await session.execute(
+                select(Signal).where(
+                    and_(
+                        Signal.outcome.is_(None),
+                        Signal.generated_at <= cutoff,
+                        Signal.take_profit.isnot(None),
+                        Signal.stop_loss.isnot(None),
+                    )
+                )
+            )
+            pending = result.scalars().all()
+
+            if not pending:
+                return
+
+            for sig in pending:
+                window_end = sig.generated_at + timedelta(hours=EVALUATION_WINDOW_H)
+                candle_result = await session.execute(
+                    select(PriceCandle)
+                    .where(
+                        and_(
+                            PriceCandle.open_time >= sig.generated_at,
+                            PriceCandle.open_time <= window_end,
+                        )
+                    )
+                    .order_by(PriceCandle.open_time.asc())
+                )
+                candles = candle_result.scalars().all()
+
+                outcome = "OPEN"
+                outcome_price = None
+                outcome_at = None
+
+                is_long = sig.signal_type in ("BUY", "STRONG_BUY")
+
+                for c in candles:
+                    h = float(c.high_price)
+                    lo = float(c.low_price)
+                    tp = float(sig.take_profit)
+                    sl = float(sig.stop_loss)
+
+                    if is_long:
+                        if h >= tp:
+                            outcome, outcome_price, outcome_at = "WIN", tp, c.open_time
+                            break
+                        if lo <= sl:
+                            outcome, outcome_price, outcome_at = "LOSS", sl, c.open_time
+                            break
+                    else:  # SHORT
+                        if lo <= tp:
+                            outcome, outcome_price, outcome_at = "WIN", tp, c.open_time
+                            break
+                        if h >= sl:
+                            outcome, outcome_price, outcome_at = "LOSS", sl, c.open_time
+                            break
+
+                entry = float(sig.entry_price)
+                if outcome_price and entry:
+                    if is_long:
+                        pnl = (outcome_price - entry) / entry * 100
+                    else:
+                        pnl = (entry - outcome_price) / entry * 100
+                else:
+                    pnl = None
+
+                sig.outcome = outcome
+                sig.outcome_price = outcome_price
+                sig.outcome_at = outcome_at or datetime.now(timezone.utc)
+                sig.pnl_percent = round(pnl, 4) if pnl is not None else None
+
+                logger.info(
+                    "Signal %d resolved: %s (pnl=%.2f%%)", sig.id, outcome, pnl or 0
+                )
+
+            await session.commit()
+            logger.info("Resolved outcomes for %d signal(s)", len(pending))
+
+    except Exception as exc:
+        logger.error("Signal outcome resolution failed: %s", exc, exc_info=True)
 
 
 async def _news_poll_loop() -> None:
