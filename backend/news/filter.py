@@ -28,6 +28,17 @@ SIMILARITY_THRESHOLD = 0.20
 # How far back to look for corroborating articles (in hours)
 CROSS_REF_WINDOW_H = 2
 
+# Established crypto news sources — articles from these outlets are trusted
+# directly and bypass the cross-reference requirement.  The cross-reference
+# check still runs but a source-trust pass overrides a failed similarity check.
+TRUSTED_SOURCES = {
+    "coindesk",
+    "cointelegraph",
+    "bitcoin_magazine",
+    "reuters",
+    "bloomberg",
+}
+
 
 @dataclass
 class FilterDecision:
@@ -111,11 +122,17 @@ class FakeNewsFilter:
                 best_match_source = other.source
 
         cross_referenced = best_score >= self._threshold
+        # Articles from established/trusted sources pass regardless of
+        # cross-reference — they are already verified outlets.
+        from_trusted_source = article.source.lower() in TRUSTED_SOURCES
+        passes = cross_referenced or from_trusted_source
         return FilterDecision(
             url=article.url,
-            is_filtered=not cross_referenced,
-            cross_referenced=cross_referenced,
-            matched_source=best_match_source if cross_referenced else None,
+            is_filtered=not passes,
+            cross_referenced=cross_referenced or from_trusted_source,
+            matched_source=best_match_source if cross_referenced else (
+                article.source if from_trusted_source else None
+            ),
             similarity_score=round(best_score, 4) if best_score > 0 else None,
         )
 
