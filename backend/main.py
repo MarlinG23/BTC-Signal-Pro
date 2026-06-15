@@ -416,17 +416,49 @@ async def websocket_endpoint(websocket: WebSocket):
 # ── Background task callbacks ─────────────────────────────────────────────────
 
 
+def _get_4h_trend_direction() -> int:
+    """
+    Derive the 4-hour trend direction from the 4H IndicatorCalculator.
+
+    Returns +1 (bullish), -1 (bearish), or 0 (neutral/insufficient data).
+
+    Logic: uses the same EMA alignment and RSI checks as the 1M engine but
+    on 4H data.  The 4H trend must agree with a 1M signal before it fires.
+
+      Bullish  (+1): price > EMA20 > EMA50  AND  RSI < 70
+      Bearish  (-1): price < EMA20 < EMA50  AND  RSI > 30
+      Neutral   (0): mixed or insufficient data
+    """
+    snap = calculator_4h.get_snapshot()
+    if snap is None or snap.close_price is None:
+        return 0
+
+    p = snap.close_price
+    e20 = snap.ema_20
+    e50 = snap.ema_50
+    rsi = snap.rsi_14
+
+    if None in (e20, e50):
+        return 0
+
+    if p > e20 > e50 and (rsi is None or rsi < 70):
+        return +1
+    if p < e20 < e50 and (rsi is None or rsi > 30):
+        return -1
+    return 0
+
+
 async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None:
     """
     Called by BinanceWebSocketClient on every closed 1-minute candle.
 
     Actions:
-      1. Persist candle + indicators to DB
-      2. Evaluate signal engine
-      3. Check key level proximity
-      4. Broadcast indicators to WS clients
+      1. Broadcast indicators to WS clients
+      2. Persist candle + indicators to DB
+      3. Evaluate signal engine with dual-timeframe gate
+      4. Check key level proximity
     """
-    # Broadcast indicator update to all WS clients
+    # Broadcast 1M indicator update to all WS clients
     try:
         snap_dict = _snapshot_to_dict(snapshot)
         snap_dict["type"] = "indicators"
@@ -437,14 +469,36 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
     # Persist to DB
     await _persist_candle(candle, snapshot)
 
-    # Run signal engine — pass candle count so it can skip noisy early candles
+    # ── Dual-timeframe signal gate ──────────────────────────────────────
+    # Step 1: evaluate 1M signal (entry timing)
     signal = signal_engine.evaluate(snapshot, candle_count=calculator.candle_count())
+
     if signal:
-        signal_id = await _persist_signal(signal)
-        await alert_manager.fire_signal_alert(signal)
-        # Broadcast signal
-        sig_dict = {**signal.to_dict(), "type": "signal"}
-        await alert_manager.ws_broadcaster.broadcast(sig_dict)
+        # Step 2: check 4H trend direction agrees with the 1M signal
+        trend = _get_4h_trend_direction()
+        signal_is_bullish = signal.signal_type.value in ("BUY", "STRONG_BUY")
+        signal_is_bearish = signal.signal_type.value in ("SELL", "STRONG_SELL")
+
+        trend_confirms = (
+            (signal_is_bullish and trend == +1) or
+            (signal_is_bearish and trend == -1) or
+            trend == 0  # no 4H data yet → don't block
+        )
+
+        if trend_confirms:
+            signal_id = await _persist_signal(signal)
+            await alert_manager.fire_signal_alert(signal)
+            sig_dict = {**signal.to_dict(), "type": "signal", "trend_4h": trend}
+            await alert_manager.ws_broadcaster.broadcast(sig_dict)
+            logger.info(
+                "Dual-TF confirmed signal: %s (1M) — trend_4h=%+d",
+                signal.signal_type.value, trend,
+            )
+        else:
+            logger.info(
+                "1M signal %s blocked: 4H trend=%+d disagrees",
+                signal.signal_type.value, trend,
+            )
 
     # Check key level proximity
     if snapshot.close_price and _key_levels:
