@@ -26,7 +26,10 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # Binance stream URLs
-WS_BASE = "wss://stream.binance.com:9443/stream"
+# binance.us is the US-regulated endpoint — not geo-blocked on US cloud servers
+# (binance.com returns HTTP 451 from Railway US West due to legal restrictions)
+WS_BASE = "wss://stream.binance.us:9443/stream"
+WS_BASE_COM = "wss://stream.binance.com:9443/stream"
 WS_BASE_TESTNET = "wss://testnet.binance.vision/stream"
 SYMBOL = "btcusdt"
 
@@ -107,7 +110,12 @@ class BinanceWebSocketClient:
     # ── Private helpers ───────────────────────────────────────────────────
 
     def _build_url(self) -> str:
-        base = WS_BASE_TESTNET if settings.BINANCE_TESTNET else WS_BASE
+        if settings.BINANCE_TESTNET:
+            base = WS_BASE_TESTNET
+        elif settings.BINANCE_USE_US_ENDPOINT:
+            base = WS_BASE          # binance.us — not geo-blocked on US servers
+        else:
+            base = WS_BASE_COM      # binance.com — blocked on Railway US West
         streams = [
             f"{SYMBOL}@kline_1m",
             f"{SYMBOL}@bookTicker",

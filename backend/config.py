@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     BINANCE_API_KEY: str = ""
     BINANCE_API_SECRET: str = ""
     BINANCE_TESTNET: bool = False
+    # Use binance.us instead of binance.com — required on US-based cloud servers
+    # (Railway US West receives HTTP 451 from binance.com due to legal restrictions)
+    BINANCE_USE_US_ENDPOINT: bool = True
 
     # ── Firebase ──────────────────────────────────────────────────────────
     FIREBASE_PROJECT_ID: str = ""
