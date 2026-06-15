@@ -121,7 +121,9 @@ class BinanceWebSocketClient:
                         high=float(k[2]),
                         low=float(k[3]),
                         close=float(k[4]),
-                        volume=float(k[5]),
+                        # k[7] = quote asset volume (USDT dollar volume)
+                        # k[5] = base asset volume (raw BTC — too small on Binance US)
+                        volume=float(k[7]),
                     )
                     self._calculator.push_candle(candle)
                     # Update latest price from historical data
@@ -240,7 +242,9 @@ class BinanceWebSocketClient:
                 high=float(k["h"]),
                 low=float(k["l"]),
                 close=float(k["c"]),
-                volume=float(k["v"]),
+                # "q" = quote asset volume (USDT dollar volume)
+                # "v" = base asset volume (raw BTC — too small on Binance US)
+                volume=float(k["q"]),
             )
         except (KeyError, ValueError) as exc:
             logger.error("Malformed kline payload: %s — %s", k, exc)
