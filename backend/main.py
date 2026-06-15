@@ -42,10 +42,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Shared singletons ─────────────────────────────────────────────────────────
-calculator = IndicatorCalculator()
+calculator = IndicatorCalculator()        # 1-minute candles (entry timing)
+calculator_4h = IndicatorCalculator()     # 4-hour candles  (trend direction)
 signal_engine = SignalEngine()
 alert_manager = AlertManager(db_session_factory=AsyncSessionLocal)
-binance_ws = BinanceWebSocketClient(calculator)
+binance_ws = BinanceWebSocketClient(calculator, calculator_4h=calculator_4h)
 sentiment_analyzer = SentimentAnalyzer()
 fake_news_filter = FakeNewsFilter()
 
@@ -144,6 +145,17 @@ async def get_indicators():
     if snap is None:
         raise HTTPException(status_code=503, detail="No indicator data yet. Warming up.")
     return _snapshot_to_dict(snap)
+
+
+@app.get("/api/indicators/4h")
+async def get_indicators_4h():
+    """Return the latest 4-hour indicator snapshot (trend timeframe)."""
+    snap = calculator_4h.get_snapshot()
+    if snap is None:
+        raise HTTPException(status_code=503, detail="4H indicators warming up.")
+    d = _snapshot_to_dict(snap)
+    d["candles_buffered"] = calculator_4h.candle_count()
+    return d
 
 
 @app.get("/api/fear-greed")

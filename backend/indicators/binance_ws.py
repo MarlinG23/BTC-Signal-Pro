@@ -55,8 +55,13 @@ class BinanceWebSocketClient:
         await client.run()  # runs forever, reconnecting as needed
     """
 
-    def __init__(self, calculator: IndicatorCalculator) -> None:
+    def __init__(
+        self,
+        calculator: IndicatorCalculator,
+        calculator_4h: Optional[IndicatorCalculator] = None,
+    ) -> None:
         self._calculator = calculator
+        self._calculator_4h = calculator_4h
         self._candle_callbacks: list[Callable[[Candle, IndicatorSnapshot], Awaitable[None]]] = []
         self._tick_callbacks: list[Callable[[dict], Awaitable[None]]] = []
         self._running = False
@@ -142,6 +147,62 @@ class BinanceWebSocketClient:
         logger.warning("Could not preload historical candles from any endpoint")
         return 0
 
+    async def preload_4h_candles(self, limit: int = 200) -> int:
+        """Fetch the last `limit` closed 4-hour candles and push them into the
+        4H IndicatorCalculator so the trend signal is available immediately.
+
+        With 200 candles the EMA-200 on the 4H chart is fully warmed up,
+        giving a reliable long-term trend direction.
+        """
+        if self._calculator_4h is None:
+            return 0
+
+        import httpx
+
+        endpoints = (
+            [REST_BASE_US, REST_BASE_COM]
+            if settings.BINANCE_USE_US_ENDPOINT
+            else [REST_BASE_COM, REST_BASE_US]
+        )
+        params = {
+            "symbol": SYMBOL_UPPER,
+            "interval": "4h",
+            "limit": limit,
+        }
+
+        for base in endpoints:
+            url = f"{base}/api/v3/klines"
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(url, params=params)
+                    resp.raise_for_status()
+                    klines = resp.json()
+
+                count = 0
+                for k in klines[:-1]:  # skip the current (still open) 4H candle
+                    candle = Candle(
+                        timestamp=pd.Timestamp(k[0], unit="ms", tz="UTC"),
+                        open=float(k[1]),
+                        high=float(k[2]),
+                        low=float(k[3]),
+                        close=float(k[4]),
+                        volume=float(k[7]),  # USDT quote volume
+                    )
+                    self._calculator_4h.push_candle(candle)
+                    count += 1
+
+                logger.info(
+                    "Preloaded %d × 4H candles from %s — trend indicators ready",
+                    count, base,
+                )
+                return count
+
+            except Exception as exc:
+                logger.warning("4H candle preload failed from %s: %s", base, exc)
+
+        logger.warning("Could not preload 4H candles from any endpoint")
+        return 0
+
     async def run(self) -> None:
         """
         Start the WebSocket connection loop.  Reconnects indefinitely with
@@ -151,9 +212,10 @@ class BinanceWebSocketClient:
         backoff = INITIAL_BACKOFF_S
         attempt = 0
 
-        # Preload historical candles once so indicators are warm before
-        # the first live candle arrives via WebSocket.
+        # Preload both timeframes before WebSocket connects so all
+        # indicators are ready from the first live candle.
         await self.preload_historical_candles(limit=50)
+        await self.preload_4h_candles(limit=200)
 
         while self._running:
             attempt += 1
