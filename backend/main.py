@@ -474,27 +474,50 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
     signal = signal_engine.evaluate(snapshot, candle_count=calculator.candle_count())
 
     if signal:
-        # Step 2: check 4H trend direction agrees with the 1M signal
-        trend = _get_4h_trend_direction()
         signal_is_bullish = signal.signal_type.value in ("BUY", "STRONG_BUY")
         signal_is_bearish = signal.signal_type.value in ("SELL", "STRONG_SELL")
 
+        # Step 2: check 4H trend direction agrees with the 1M signal
+        trend = _get_4h_trend_direction()
         trend_confirms = (
             (signal_is_bullish and trend == +1) or
             (signal_is_bearish and trend == -1) or
             trend == 0  # no 4H data yet → don't block
         )
 
-        if trend_confirms:
+        # Step 3: Fear & Greed macro filter
+        #   BUY  signals only when F&G < 40 (fear zone — market oversold at macro level)
+        #   SELL signals only when F&G > 60 (greed zone — market overextended)
+        #   HOLD signals pass through always
+        fg_value = _latest_fear_greed.get("value") if _latest_fear_greed else None
+        fg_allows = True
+        if fg_value is not None:
+            if signal_is_bullish and fg_value >= 40:
+                fg_allows = False
+                logger.info(
+                    "BUY signal blocked: Fear & Greed=%d (need < 40 for BUY)", fg_value
+                )
+            elif signal_is_bearish and fg_value <= 60:
+                fg_allows = False
+                logger.info(
+                    "SELL signal blocked: Fear & Greed=%d (need > 60 for SELL)", fg_value
+                )
+
+        if trend_confirms and fg_allows:
             signal_id = await _persist_signal(signal)
             await alert_manager.fire_signal_alert(signal)
-            sig_dict = {**signal.to_dict(), "type": "signal", "trend_4h": trend}
+            sig_dict = {
+                **signal.to_dict(),
+                "type": "signal",
+                "trend_4h": trend,
+                "fear_greed": fg_value,
+            }
             await alert_manager.ws_broadcaster.broadcast(sig_dict)
             logger.info(
-                "Dual-TF confirmed signal: %s (1M) — trend_4h=%+d",
-                signal.signal_type.value, trend,
+                "Signal fired: %s conf=%.1f%% 4H_trend=%+d F&G=%s",
+                signal.signal_type.value, signal.confidence, trend, fg_value,
             )
-        else:
+        elif not trend_confirms:
             logger.info(
                 "1M signal %s blocked: 4H trend=%+d disagrees",
                 signal.signal_type.value, trend,
