@@ -67,6 +67,8 @@ class BinanceWebSocketClient:
         self._running = False
         self._latest_price: Optional[float] = None
         self._latest_price_time: Optional[float] = None
+        self._connected = False
+        self._last_message_time: Optional[float] = None
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -83,6 +85,16 @@ class BinanceWebSocketClient:
     @property
     def latest_price(self) -> Optional[float]:
         return self._latest_price
+
+    @property
+    def ws_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def ws_last_message_seconds(self) -> Optional[float]:
+        if self._last_message_time is None:
+            return None
+        return round(time.time() - self._last_message_time, 1)
 
     def update_latest_price(self, price: float) -> None:
         """Update the cached price (used by REST fallback when Binance is unavailable)."""
@@ -203,7 +215,7 @@ class BinanceWebSocketClient:
         logger.warning("Could not preload 4H candles from any endpoint")
         return 0
 
-    async def run(self) -> None:
+    async def run(self, skip_preload: bool = False) -> None:
         """
         Start the WebSocket connection loop.  Reconnects indefinitely with
         exponential back-off.  Call stop() to terminate gracefully.
@@ -212,10 +224,9 @@ class BinanceWebSocketClient:
         backoff = INITIAL_BACKOFF_S
         attempt = 0
 
-        # Preload both timeframes before WebSocket connects so all
-        # indicators are ready from the first live candle.
-        await self.preload_historical_candles(limit=50)
-        await self.preload_4h_candles(limit=200)
+        if not skip_preload:
+            await self.preload_historical_candles(limit=50)
+            await self.preload_4h_candles(limit=200)
 
         while self._running:
             attempt += 1
@@ -263,15 +274,19 @@ class BinanceWebSocketClient:
             ping_timeout=10,
             close_timeout=5,
         ) as ws:
+            self._connected = True
             logger.info("Binance WebSocket connected.")
-            async for raw_message in ws:
-                if not self._running:
-                    break
-                try:
-                    await self._dispatch(json.loads(raw_message))
-                except Exception as exc:
-                    # Never crash the receive loop on a single bad message
-                    logger.warning("Error processing WebSocket message: %s", exc)
+            try:
+                async for raw_message in ws:
+                    if not self._running:
+                        break
+                    self._last_message_time = time.time()
+                    try:
+                        await self._dispatch(json.loads(raw_message))
+                    except Exception as exc:
+                        logger.warning("Error processing WebSocket message: %s", exc)
+            finally:
+                self._connected = False
 
     async def _dispatch(self, envelope: dict) -> None:
         """Route an incoming combined-stream envelope to the correct handler."""

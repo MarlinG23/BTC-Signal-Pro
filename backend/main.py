@@ -15,6 +15,7 @@ signals, and alerts in real time via a shared broadcaster.
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -57,6 +58,14 @@ _key_levels: list[float] = []
 # endpoint can serve it immediately without making an outbound request.
 _latest_fear_greed: Optional[dict] = None
 
+# Startup / status tracking
+_startup_ready = False
+_app_start_time = time.time()
+_db_connected = False
+_last_news_fetch: Optional[datetime] = None
+_news_count = 0
+_last_signal_at: Optional[datetime] = None
+
 
 # ── Application lifespan ──────────────────────────────────────────────────────
 
@@ -64,36 +73,72 @@ _latest_fear_greed: Optional[dict] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handle startup and shutdown events."""
+    global _startup_ready, _db_connected, _latest_fear_greed
+    global _last_news_fetch, _news_count
+
     logger.info("BTC Signal Pro starting up...")
 
-    # 1. Init DB tables
+    # 1. Connect database
     try:
         await init_db()
+        _db_connected = True
+        logger.info("Database connected.")
     except Exception as exc:
+        _db_connected = False
         logger.error("DB init failed — running without persistence: %s", exc)
 
-    # 2. Register WebSocket callbacks
+    # 2. Preload 300 × 1M candles
+    loaded_1m = await binance_ws.preload_historical_candles(limit=300)
+    logger.info("Preloaded %d × 1M candles", loaded_1m)
+
+    # 3. Preload 200 × 4H candles
+    loaded_4h = await binance_ws.preload_4h_candles(limit=200)
+    logger.info("Preloaded %d × 4H candles", loaded_4h)
+
+    # 4. Fetch Fear & Greed (wait)
+    try:
+        async with NewsFetcher() as fetcher:
+            fg = await fetcher.fetch_fear_greed()
+        if fg:
+            _latest_fear_greed = {
+                "value": fg.value,
+                "classification": fg.classification,
+                "timestamp": fg.timestamp.isoformat(),
+            }
+            logger.info("Fear & Greed loaded: %d (%s)", fg.value, fg.classification)
+    except Exception as exc:
+        logger.error("Startup Fear & Greed fetch failed: %s", exc)
+
+    # 5. Fetch news (wait)
+    await _fetch_and_process_news()
+
+    # Register WebSocket callbacks
     binance_ws.on_candle_closed(_on_candle_closed)
     binance_ws.on_price_tick(_on_price_tick)
 
-    # 3. Start Binance WebSocket
-    ws_task = asyncio.create_task(binance_ws.run(), name="binance-ws")
+    # 6. Start Binance WebSocket (preload already done above)
+    ws_task = asyncio.create_task(binance_ws.run(skip_preload=True), name="binance-ws")
 
-    # 4. Start news polling (every 5 minutes)
+    # 7. Signal engine is ready (evaluate() runs on each closed candle)
+    logger.info("Signal engine ready.")
+
+    # 8. Start background loops
     news_task = asyncio.create_task(_news_poll_loop(), name="news-poll")
-
-    # 5. Start REST price fallback when Binance WebSocket is geo-blocked/unavailable
     fallback_task = asyncio.create_task(_price_fallback_loop(), name="price-fallback")
-
-    # 6. Start signal outcome checker (runs every 5 minutes)
     outcome_task = asyncio.create_task(_outcome_check_loop(), name="outcome-check")
 
-    logger.info("BTC Signal Pro ready. Listening on %s:%d", settings.APP_HOST, settings.APP_PORT)
+    _startup_ready = True
+    logger.info(
+        "BTC Signal Pro ready. Listening on %s:%d",
+        settings.APP_HOST,
+        settings.APP_PORT,
+    )
 
     yield  # application runs here
 
     # Graceful shutdown
     logger.info("Shutting down...")
+    _startup_ready = False
     await binance_ws.stop()
     ws_task.cancel()
     news_task.cancel()
@@ -130,6 +175,8 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     """Health check endpoint used by Railway for liveness probes."""
+    if not _startup_ready:
+        raise HTTPException(status_code=503, detail="Service is starting up.")
     return {
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -793,8 +840,10 @@ async def _fetch_and_process_news() -> None:
             )
 
         # Cache and broadcast Fear & Greed
+        global _latest_fear_greed, _last_news_fetch, _news_count
+        _last_news_fetch = datetime.now(timezone.utc)
+        _news_count = len(articles)
         if fear_greed:
-            global _latest_fear_greed
             _latest_fear_greed = {
                 "value": fear_greed.value,
                 "classification": fear_greed.classification,
@@ -867,6 +916,7 @@ async def _persist_candle(candle: Candle, snapshot: IndicatorSnapshot) -> None:
 
 async def _persist_signal(signal: SignalResult) -> Optional[int]:
     """Persist a signal to the database. Returns the new row's ID."""
+    global _last_signal_at
     try:
         async with AsyncSessionLocal() as session:
             db_signal = Signal(
@@ -883,6 +933,7 @@ async def _persist_signal(signal: SignalResult) -> Optional[int]:
             await session.flush()
             signal_id = db_signal.id
             await session.commit()
+            _last_signal_at = signal.generated_at
             return signal_id
     except Exception as exc:
         logger.error("Failed to persist signal: %s", exc)
