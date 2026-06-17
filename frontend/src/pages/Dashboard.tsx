@@ -31,6 +31,7 @@ import { NewsFeed } from "../components/NewsFeed";
 import { AlertLog } from "../components/AlertLog";
 import { SignalHistory } from "../components/SignalHistory";
 import { BacktestPanel } from "../components/BacktestPanel";
+import { StatusBar } from "../components/StatusBar";
 
 // Sound alert using Web Audio API — plays a short beep on new signal
 function playSignalSound(type: string) {
@@ -192,6 +193,8 @@ export function Dashboard() {
           connected={connected}
           candles={candleCount}
         />
+
+        <StatusBar />
 
         {/* Main grid */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">

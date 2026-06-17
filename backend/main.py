@@ -185,6 +185,43 @@ async def health_check():
     }
 
 
+@app.get("/api/status")
+async def get_system_status(db: AsyncSession = Depends(get_db)):
+    """Return a full operational health snapshot for the dashboard status bar."""
+    last_signal_iso = _last_signal_at.isoformat() if _last_signal_at else None
+    if last_signal_iso is None and _db_connected:
+        try:
+            from sqlalchemy import select
+
+            result = await db.execute(
+                select(Signal).order_by(Signal.generated_at.desc()).limit(1)
+            )
+            sig = result.scalar_one_or_none()
+            if sig:
+                last_signal_iso = sig.generated_at.isoformat()
+        except Exception as exc:
+            logger.debug("Could not fetch last signal for status: %s", exc)
+
+    fg_updated = (
+        _latest_fear_greed.get("timestamp") if _latest_fear_greed else None
+    )
+
+    return {
+        "candles_1m": calculator.candle_count(),
+        "candles_4h": calculator_4h.candle_count(),
+        "last_news_fetch": _last_news_fetch.isoformat() if _last_news_fetch else None,
+        "news_count": _news_count,
+        "fear_greed": _latest_fear_greed.get("value") if _latest_fear_greed else None,
+        "fear_greed_updated": fg_updated,
+        "ws_connected": binance_ws.ws_connected,
+        "ws_last_message_seconds": binance_ws.ws_last_message_seconds,
+        "last_signal": last_signal_iso,
+        "db_connected": _db_connected,
+        "uptime_seconds": int(time.time() - _app_start_time),
+        "startup_ready": _startup_ready,
+    }
+
+
 @app.get("/api/indicators")
 async def get_indicators():
     """Return the latest computed indicator snapshot."""

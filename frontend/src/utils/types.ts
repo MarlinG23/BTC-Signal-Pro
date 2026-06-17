@@ -73,6 +73,21 @@ export interface FearGreedData {
   timestamp: string;
 }
 
+export interface SystemStatus {
+  candles_1m: number;
+  candles_4h: number;
+  last_news_fetch: string | null;
+  news_count: number;
+  fear_greed: number | null;
+  fear_greed_updated: string | null;
+  ws_connected: boolean;
+  ws_last_message_seconds: number | null;
+  last_signal: string | null;
+  db_connected: boolean;
+  uptime_seconds: number;
+  startup_ready: boolean;
+}
+
 export interface TrendSignal {
   direction: 1 | -1 | 0;        // +1 bullish, -1 bearish, 0 neutral
   label: "BULLISH" | "BEARISH" | "NEUTRAL" | "LOADING";
