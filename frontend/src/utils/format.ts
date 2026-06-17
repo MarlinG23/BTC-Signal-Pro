@@ -2,7 +2,12 @@
  * Formatting utilities used across the dashboard.
  */
 
-import { differenceInMinutes, formatDistanceToNow, parseISO } from "date-fns";
+import {
+  differenceInMinutes,
+  differenceInSeconds,
+  formatDistanceToNow,
+  parseISO,
+} from "date-fns";
 
 /** Format a number as a USD price with commas and up to 2 decimal places. */
 export function formatPrice(value: number | null | undefined): string {
@@ -39,6 +44,18 @@ export function timeAgo(isoString: string | null | undefined): string {
   if (!isoString) return "—";
   try {
     return formatDistanceToNow(parseISO(isoString), { addSuffix: true });
+  } catch {
+    return "—";
+  }
+}
+
+/** Relative freshness in seconds (for live signal age). */
+export function timeAgoSeconds(isoString: string | null | undefined): string {
+  if (!isoString) return "—";
+  try {
+    const seconds = differenceInSeconds(new Date(), parseISO(isoString));
+    if (seconds < 1) return "just now";
+    return `${seconds} second${seconds === 1 ? "" : "s"} ago`;
   } catch {
     return "—";
   }

@@ -3,9 +3,11 @@
  * Changes color and animation based on the current signal type.
  */
 
+import { useEffect, useState } from "react";
 import clsx from "clsx";
 import { Signal, SignalType } from "../utils/types";
-import { formatPrice, fmt, timeAgo } from "../utils/format";
+import { formatPrice, fmt, timeAgoSeconds } from "../utils/format";
+import { isSignalFresh } from "../utils/signalFreshness";
 
 interface SignalBadgeProps {
   signal: Signal | null;
@@ -74,29 +76,44 @@ const SIGNAL_CONFIG: Record<
 };
 
 export function SignalBadge({ signal, currentPrice, atr14 }: SignalBadgeProps) {
-  if (!signal) {
+  const [, setTick] = useState(0);
+  const fresh = signal != null && isSignalFresh(signal.generated_at);
+  const activeSignal = fresh ? signal : null;
+
+  useEffect(() => {
+    if (!fresh) return;
+    const id = window.setInterval(() => setTick((t) => t + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [fresh, signal?.generated_at]);
+
+  if (!activeSignal) {
     return (
       <div className="card flex flex-col items-center justify-center py-8 gap-2">
         <div className="text-4xl">📊</div>
-        <p className="text-brand-muted text-sm">Waiting for signal…</p>
-        <p className="text-brand-muted text-xs">Warming up indicators</p>
+        <p className="text-brand-muted text-sm">HOLD — no active signal</p>
+        <p className="text-brand-muted text-xs">
+          {signal && !fresh
+            ? "Last signal expired (older than 5 minutes)"
+            : "Waiting for fresh entry signal…"}
+        </p>
       </div>
     );
   }
 
-  const config = SIGNAL_CONFIG[signal.signal_type];
+  const config = SIGNAL_CONFIG[activeSignal.signal_type];
   const isActionable =
-    signal.signal_type !== "HOLD" && signal.signal_type !== null;
+    activeSignal.signal_type !== "HOLD" && activeSignal.signal_type !== null;
 
-  const liveEntry = currentPrice ?? signal.entry_price;
+  const liveEntry = currentPrice ?? activeSignal.entry_price;
   const liveLevels =
     liveEntry != null
-      ? computeLiveLevels(liveEntry, atr14, signal.signal_type)
+      ? computeLiveLevels(liveEntry, atr14, activeSignal.signal_type)
       : null;
-  const displayTp = liveLevels?.tp ?? signal.take_profit;
-  const displaySl = liveLevels?.sl ?? signal.stop_loss;
-  const displayRr = liveLevels?.rr ?? signal.risk_reward_ratio;
-  const usingLivePrice = currentPrice != null && currentPrice !== signal.entry_price;
+  const displayTp = liveLevels?.tp ?? activeSignal.take_profit;
+  const displaySl = liveLevels?.sl ?? activeSignal.stop_loss;
+  const displayRr = liveLevels?.rr ?? activeSignal.risk_reward_ratio;
+  const usingLivePrice =
+    currentPrice != null && currentPrice !== activeSignal.entry_price;
 
   return (
     <div
@@ -115,19 +132,19 @@ export function SignalBadge({ signal, currentPrice, atr14 }: SignalBadgeProps) {
             {config.label}
           </div>
           <div className="text-brand-muted text-sm mt-1">
-            {signal.confidence.toFixed(1)}% confidence · {signal.indicators_agreed} indicators agreed
+            {activeSignal.confidence.toFixed(1)}% confidence · {activeSignal.indicators_agreed} indicators agreed
           </div>
         </div>
       </div>
 
       {/* Price levels — entry anchored to live price when available */}
-      {signal.signal_type !== "HOLD" && (
+      {activeSignal.signal_type !== "HOLD" && (
         <div className="w-full mt-2 space-y-2 text-center">
           <p className="text-brand-muted text-xs">
-            Signal at {timeAgo(signal.generated_at)}
+            Signal generated {timeAgoSeconds(activeSignal.generated_at)}
             {usingLivePrice && (
               <span className="block text-brand-muted/80">
-                Original entry {formatPrice(signal.entry_price)}
+                Original entry {formatPrice(activeSignal.entry_price)}
               </span>
             )}
           </p>

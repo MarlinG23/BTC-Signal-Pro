@@ -32,6 +32,7 @@ import { AlertLog } from "../components/AlertLog";
 import { SignalHistory } from "../components/SignalHistory";
 import { BacktestPanel } from "../components/BacktestPanel";
 import { StatusBar } from "../components/StatusBar";
+import { isSignalFresh } from "../utils/signalFreshness";
 
 // Sound alert using Web Audio API — plays a short beep on new signal
 function playSignalSound(type: string) {
@@ -181,9 +182,13 @@ export function Dashboard() {
     }
   }
 
-  // Use the most recent signal from live WS or historical API
-  const displaySignal =
+  // Use the most recent fresh signal from live WS or historical API (< 5 min)
+  const candidateSignal =
     latestSignal ?? (historicalSignals && historicalSignals[0]) ?? null;
+  const displaySignal =
+    candidateSignal && isSignalFresh(candidateSignal.generated_at)
+      ? candidateSignal
+      : null;
 
   return (
     <div className="min-h-screen bg-brand-dark">
