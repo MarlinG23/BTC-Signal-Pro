@@ -29,7 +29,7 @@ from database.connection import AsyncSessionLocal, get_db, init_db
 from database.models import Alert, NewsItem, PriceCandle, Signal, TechnicalIndicator
 from indicators.binance_ws import BinanceWebSocketClient
 from indicators.calculator import Candle, IndicatorCalculator, IndicatorSnapshot
-from news.fetcher import NewsFetcher
+from news.fetcher import NEWS_POLL_INTERVAL_S, NewsFetcher
 from news.filter import FakeNewsFilter
 from news.sentiment import SentimentAnalyzer
 from signals.backtester import BacktestEngine
@@ -263,7 +263,6 @@ async def get_news(
 
         stmt = (
             select(NewsItem)
-            .where(NewsItem.is_filtered == False)  # noqa: E712
             .order_by(NewsItem.published_at.desc())
             .limit(min(limit, 100))
         )
@@ -684,20 +683,16 @@ async def _resolve_signal_outcomes() -> None:
 
 
 async def _news_poll_loop() -> None:
-    """Background loop: fetch news every 5 minutes and process it.
-
-    Runs immediately on startup so Fear & Greed and news are available
-    as soon as the first client connects.
-    """
+    """Background loop: fetch news every 15 minutes."""
     while True:
         try:
             await _fetch_and_process_news()
-            await asyncio.sleep(300)  # 5 minutes
+            await asyncio.sleep(NEWS_POLL_INTERVAL_S)
         except asyncio.CancelledError:
             break
         except Exception as exc:
             logger.error("News poll loop error: %s", exc)
-            await asyncio.sleep(60)  # back off on error
+            await asyncio.sleep(60)
 
 
 async def _fetch_and_process_news() -> None:
@@ -709,11 +704,10 @@ async def _fetch_and_process_news() -> None:
             liquidations = await fetcher.fetch_coinglass_liquidations()
 
         if not articles:
-            logger.debug("No articles fetched.")
-            return
+            logger.debug("No articles fetched this cycle.")
 
-        # Apply fake-news filter
-        decisions = fake_news_filter.evaluate_batch(articles)
+        # Quality badge (cross-reference) — never blocks publication
+        decisions = fake_news_filter.evaluate_batch(articles) if articles else []
 
         # Process each article
         async with AsyncSessionLocal() as session:
@@ -767,11 +761,8 @@ async def _fetch_and_process_news() -> None:
                 )
                 await session.execute(stmt)
 
-                # Alert on high-impact verified articles
-                if not decision.is_filtered and (
-                    sentiment_result.is_geopolitical
-                    or sentiment_result.sentiment.value != "NEUTRAL"
-                ):
+                # Alert on high-impact articles (quality badge shown via cross_referenced)
+                if sentiment_result.is_geopolitical or sentiment_result.sentiment.value != "NEUTRAL":
                     await alert_manager.fire_news_alert(
                         title=article.title,
                         source=article.source,
@@ -786,10 +777,12 @@ async def _fetch_and_process_news() -> None:
                             "sentiment": sentiment_result.sentiment.value,
                             "score": sentiment_result.score,
                             "is_geopolitical": sentiment_result.is_geopolitical,
+                            "cross_referenced": decision.cross_referenced,
                         }
                     )
 
-            await session.commit()
+            if articles:
+                await session.commit()
 
         # Liquidation alert
         if liquidations:
@@ -946,6 +939,7 @@ def _news_to_dict(n: NewsItem) -> dict:
         "sentiment_score": n.sentiment_score,
         "is_geopolitical": n.is_geopolitical,
         "geo_keywords": n.geo_keywords,
+        "cross_referenced": n.cross_referenced,
     }
 
 

@@ -14,7 +14,7 @@ All network calls use httpx with retry logic (3 attempts, exponential back-off).
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import feedparser
@@ -45,6 +45,8 @@ COINGLASS_API = "https://open-api.coinglass.com/public/v2/liquidation_history"
 
 MAX_RETRIES = 3
 RETRY_DELAY_S = 2.0
+NEWS_MAX_AGE_HOURS = 72
+NEWS_POLL_INTERVAL_S = 900  # 15 minutes
 
 
 @dataclass
@@ -129,12 +131,24 @@ class NewsFetcher:
                 seen_urls.add(a.url)
                 unique.append(a)
 
-        # Sort newest first
+        # Sort newest first, then keep articles within the 72-hour window
         unique.sort(
             key=lambda a: a.published_at or datetime.min.replace(tzinfo=timezone.utc),
             reverse=True,
         )
-        return unique
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=NEWS_MAX_AGE_HOURS)
+        fresh = [
+            a
+            for a in unique
+            if a.published_at is None or a.published_at >= cutoff
+        ]
+        source_count = len({a.source for a in fresh})
+        logger.info(
+            "News fetch: %d articles from %d sources",
+            len(fresh),
+            source_count,
+        )
+        return fresh
 
     async def fetch_coindesk(self) -> list[RawArticle]:
         """Fetch latest headlines from CoinDesk RSS feed."""

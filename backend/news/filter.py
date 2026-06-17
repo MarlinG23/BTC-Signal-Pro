@@ -84,10 +84,11 @@ class FakeNewsFilter:
             decision = self._evaluate_single(article, articles[:i] + articles[i + 1 :])
             decisions.append(decision)
 
-        verified = sum(1 for d in decisions if not d.is_filtered)
+        verified = sum(1 for d in decisions if d.cross_referenced)
         logger.info(
-            "Fake-news filter: %d/%d articles passed cross-reference check",
-            verified, len(articles)
+            "Fake-news quality check: %d/%d articles cross-referenced",
+            verified,
+            len(articles),
         )
         return decisions
 
@@ -122,14 +123,12 @@ class FakeNewsFilter:
                 best_match_source = other.source
 
         cross_referenced = best_score >= self._threshold
-        # Articles from established/trusted sources pass regardless of
-        # cross-reference — they are already verified outlets.
         from_trusted_source = article.source.lower() in TRUSTED_SOURCES
-        passes = cross_referenced or from_trusted_source
+        quality_verified = cross_referenced or from_trusted_source
         return FilterDecision(
             url=article.url,
-            is_filtered=not passes,
-            cross_referenced=cross_referenced or from_trusted_source,
+            is_filtered=False,  # quality badge only — never block publication
+            cross_referenced=quality_verified,
             matched_source=best_match_source if cross_referenced else (
                 article.source if from_trusted_source else None
             ),
