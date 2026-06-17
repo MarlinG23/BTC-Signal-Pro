@@ -16,6 +16,21 @@ jobs:
         run: npm install -g @railway/cli
 
       - name: Deploy BTC-Signal-Pro backend
-        run: railway up --service BTC-Signal-Pro --detach
+        run: railway up --service BTC-Signal-Pro --detach --ci
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+  deploy-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy frontend
+        working-directory: frontend
+        run: railway up --service frontend --detach --ci
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
