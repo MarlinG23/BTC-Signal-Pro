@@ -218,6 +218,9 @@ export function Dashboard() {
               trend4h={trend4h}
               currentPrice={livePrice}
               atr14={indicators?.atr_14 ?? null}
+              fearGreed={
+                fearGreed?.value ?? initialFearGreed?.value ?? null
+              }
             />
 
             {/* Multi-timeframe: TREND (4H) vs ENTRY (1M) */}

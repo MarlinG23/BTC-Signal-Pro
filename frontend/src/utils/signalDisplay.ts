@@ -64,3 +64,45 @@ export function displayToLevelType(
   }
   return "HOLD";
 }
+
+export type TradeReadyStatus = "ready" | "waiting_4h" | "not_met";
+
+function fearGreedAllows(
+  display: DisplaySignalType,
+  fearGreed: number | null
+): boolean {
+  if (fearGreed == null) return true;
+  if (display === "BUY") return fearGreed < 40;
+  if (display === "SELL") return fearGreed > 60;
+  return false;
+}
+
+/** Evaluate whether all four trade conditions are satisfied. */
+export function resolveTradeReadyStatus(
+  signal: Signal | null,
+  trend4h: TrendLabel,
+  fearGreed: number | null,
+  nowMs: number = Date.now()
+): TradeReadyStatus {
+  const display = resolveDisplayState(signal, trend4h, nowMs);
+
+  if (
+    display === "WAIT" &&
+    (trend4h === "NEUTRAL" || trend4h === "LOADING")
+  ) {
+    return "waiting_4h";
+  }
+
+  if (display === "BUY" || display === "SELL") {
+    const fresh = signal != null && isSignalFresh(signal.generated_at, nowMs);
+    const confident =
+      signal != null && signal.confidence >= MIN_SIGNAL_CONFIDENCE;
+    const fgOk = fearGreedAllows(display, fearGreed);
+
+    if (fresh && confident && fgOk) {
+      return "ready";
+    }
+  }
+
+  return "not_met";
+}

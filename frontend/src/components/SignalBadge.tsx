@@ -13,6 +13,7 @@ import {
   DisplaySignalType,
   displayToLevelType,
   resolveDisplayState,
+  resolveTradeReadyStatus,
 } from "../utils/signalDisplay";
 
 interface SignalBadgeProps {
@@ -23,6 +24,8 @@ interface SignalBadgeProps {
   currentPrice: number | null;
   /** Latest ATR(14) from 1M indicators for TP/SL recalculation. */
   atr14: number | null;
+  /** Fear & Greed index value for trade-ready gate. */
+  fearGreed: number | null;
 }
 
 function computeLiveLevels(
@@ -77,15 +80,36 @@ const DISPLAY_CONFIG: Record<
   },
 };
 
+const TRADE_READY_CONFIG = {
+  ready: {
+    emoji: "✅",
+    text: "All conditions met — ready to trade",
+    className: "text-emerald-400",
+  },
+  waiting_4h: {
+    emoji: "⏳",
+    text: "Waiting for 4H confirmation",
+    className: "text-yellow-400",
+  },
+  not_met: {
+    emoji: "❌",
+    text: "Conditions not met — hold",
+    className: "text-brand-muted",
+  },
+} as const;
+
 export function SignalBadge({
   signal,
   trend4h,
   currentPrice,
   atr14,
+  fearGreed,
 }: SignalBadgeProps) {
   const [, setTick] = useState(0);
   const fresh = signal != null && isSignalFresh(signal.generated_at);
   const displayState = resolveDisplayState(signal, trend4h);
+  const tradeReady = resolveTradeReadyStatus(signal, trend4h, fearGreed);
+  const tradeReadyConfig = TRADE_READY_CONFIG[tradeReady];
 
   useEffect(() => {
     if (!fresh) return;
@@ -94,14 +118,20 @@ export function SignalBadge({
   }, [fresh, signal?.generated_at]);
 
   if (!signal || !fresh) {
+    const idleReady = TRADE_READY_CONFIG.not_met;
     return (
-      <div className="card flex flex-col items-center justify-center py-8 gap-2">
-        <div className="text-4xl">⚪</div>
-        <p className="text-brand-muted text-sm">HOLD — no active signal</p>
-        <p className="text-brand-muted text-xs">
-          {signal && !fresh
-            ? "Last signal expired (older than 5 minutes)"
-            : "Waiting for fresh entry signal…"}
+      <div className="space-y-2">
+        <div className="card flex flex-col items-center justify-center py-8 gap-2">
+          <div className="text-4xl">⚪</div>
+          <p className="text-brand-muted text-sm">HOLD — no active signal</p>
+          <p className="text-brand-muted text-xs">
+            {signal && !fresh
+              ? "Last signal expired (older than 5 minutes)"
+              : "Waiting for fresh entry signal…"}
+          </p>
+        </div>
+        <p className={clsx("text-center text-sm", idleReady.className)}>
+          {idleReady.emoji} {idleReady.text}
         </p>
       </div>
     );
@@ -123,14 +153,15 @@ export function SignalBadge({
   const usingLivePrice = currentPrice != null && currentPrice !== signal.entry_price;
 
   return (
-    <div
-      className={clsx(
-        "card flex flex-col items-center gap-3 py-6 border-2 transition-all duration-500 animate-slide-in",
-        config.colorClass,
-        config.glowClass,
-        isActionable && "animate-pulse_slow"
-      )}
-    >
+    <div className="space-y-2">
+      <div
+        className={clsx(
+          "card flex flex-col items-center gap-3 py-6 border-2 transition-all duration-500 animate-slide-in",
+          config.colorClass,
+          config.glowClass,
+          isActionable && "animate-pulse_slow"
+        )}
+      >
       <div className="flex items-center gap-3">
         <span className="text-4xl">{config.emoji}</span>
         <div className="text-center">
@@ -192,6 +223,11 @@ export function SignalBadge({
           R:R = <span className="text-brand-blue">{fmt(displayRr, 2)}:1</span>
         </div>
       )}
+      </div>
+
+      <p className={clsx("text-center text-sm", tradeReadyConfig.className)}>
+        {tradeReadyConfig.emoji} {tradeReadyConfig.text}
+      </p>
     </div>
   );
 }
