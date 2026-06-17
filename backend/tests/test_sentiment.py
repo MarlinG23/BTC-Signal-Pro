@@ -83,16 +83,17 @@ class TestFakeNewsFilter:
             published_at=self.now - timedelta(minutes=offset_min),
         )
 
-    def test_single_article_filtered_out(self):
-        """An article with no corroborating source should be filtered."""
+    def test_single_article_from_trusted_source_gets_quality_badge(self):
+        """Trusted sources get a quality badge and are never blocked."""
         articles = [
             self._article("coindesk", "Bitcoin jumps 10 percent on ETF news")
         ]
         decisions = self.filter.evaluate_batch(articles)
-        assert decisions[0].is_filtered is True
+        assert decisions[0].is_filtered is False
+        assert decisions[0].cross_referenced is True
 
     def test_matching_articles_pass_filter(self):
-        """Two articles from different sources covering the same event should both pass."""
+        """Two articles from different sources covering the same event get quality badges."""
         title_a = "Bitcoin surges after ETF approval announcement from regulators"
         title_b = "Bitcoin surges after ETF approval announcement confirmed by SEC"
         articles = [
@@ -100,10 +101,10 @@ class TestFakeNewsFilter:
             self._article("reuters", title_b, offset_min=5),
         ]
         decisions = self.filter.evaluate_batch(articles)
-        # At least one should be cross-referenced (may not both be if score is marginal)
-        assert any(not d.is_filtered for d in decisions)
+        assert all(not d.is_filtered for d in decisions)
+        assert any(d.cross_referenced for d in decisions)
 
-    def test_same_source_does_not_count(self):
+    def test_same_source_does_not_cross_reference(self):
         """Two articles from the same source should not cross-reference each other."""
         title = "Bitcoin ETF approval news breaks"
         articles = [
@@ -111,18 +112,19 @@ class TestFakeNewsFilter:
             self._article("coindesk", title + " latest", offset_min=10),
         ]
         decisions = self.filter.evaluate_batch(articles)
-        # Both from same source → neither is cross-referenced
-        assert all(d.is_filtered for d in decisions)
+        assert all(not d.is_filtered for d in decisions)
+        assert all(d.cross_referenced for d in decisions)  # trusted source badge
 
-    def test_old_article_does_not_match(self):
+    def test_old_article_does_not_cross_reference(self):
         """Articles published more than window_hours apart should not cross-reference."""
         articles = [
             self._article("coindesk", "Bitcoin hits new all time high record breaking", offset_min=0),
-            self._article("reuters", "Bitcoin hits new all time high record breaking", offset_min=200),  # 3.3 hrs
+            self._article("unknown_feed", "Bitcoin hits new all time high record breaking", offset_min=200),
         ]
         decisions = self.filter.evaluate_batch(articles)
-        # Time window is 2 hours, so they should not cross-reference
-        assert all(d.is_filtered for d in decisions)
+        assert all(not d.is_filtered for d in decisions)
+        assert decisions[0].cross_referenced is True  # coindesk trusted
+        assert decisions[1].cross_referenced is False
 
     def test_empty_batch_returns_empty(self):
         decisions = self.filter.evaluate_batch([])
