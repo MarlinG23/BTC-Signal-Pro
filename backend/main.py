@@ -997,6 +997,7 @@ def _snapshot_to_dict(snap: IndicatorSnapshot) -> dict:
         "bb_percent_b": snap.bb_percent_b,
         "volume_sma_20": snap.volume_sma_20,
         "volume_ratio": snap.volume_ratio,
+        "atr_14": snap.atr_14,
     }
 
 

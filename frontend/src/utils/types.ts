@@ -31,6 +31,7 @@ export interface IndicatorSnapshot {
   bb_percent_b: number | null;
   volume_sma_20: number | null;
   volume_ratio: number | null;
+  atr_14: number | null;
 }
 
 export interface Signal {
@@ -71,6 +72,8 @@ export interface FearGreedData {
   value: number;
   classification: string;
   timestamp: string;
+  /** When our backend last fetched the index (ISO). Prefer for "Updated …" display. */
+  updated_at?: string;
 }
 
 export interface SystemStatus {

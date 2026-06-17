@@ -201,7 +201,11 @@ export function Dashboard() {
           {/* Left column */}
           <div className="lg:col-span-2 space-y-4">
             {/* Signal Badge — most prominent element */}
-            <SignalBadge signal={displaySignal} />
+            <SignalBadge
+              signal={displaySignal}
+              currentPrice={livePrice}
+              atr14={indicators?.atr_14 ?? null}
+            />
 
             {/* Multi-timeframe: TREND (4H) vs ENTRY (1M) */}
             <TrendPanel snapshot1m={indicators} />
