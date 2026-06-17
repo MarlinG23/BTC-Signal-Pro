@@ -77,7 +77,7 @@ export function Dashboard() {
   // Fetch Fear & Greed immediately on page load; WS updates will override
   const { data: initialFearGreed } = useApi<FearGreedData>(
     "/api/fear-greed",
-    300_000 // refresh every 5 minutes to stay in sync with backend poll
+    60_000 // refresh every minute; backend polls hourly
   );
 
   const nextAlertId = useRef(0);
@@ -156,6 +156,7 @@ export function Dashboard() {
           value: msg.value as number,
           classification: msg.classification as string,
           timestamp: msg.timestamp as string,
+          updated_at: msg.updated_at as string | undefined,
         });
         break;
       }

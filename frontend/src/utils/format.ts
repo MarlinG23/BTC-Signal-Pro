@@ -2,7 +2,7 @@
  * Formatting utilities used across the dashboard.
  */
 
-import { formatDistanceToNow, parseISO } from "date-fns";
+import { differenceInMinutes, formatDistanceToNow, parseISO } from "date-fns";
 
 /** Format a number as a USD price with commas and up to 2 decimal places. */
 export function formatPrice(value: number | null | undefined): string {
@@ -39,6 +39,18 @@ export function timeAgo(isoString: string | null | undefined): string {
   if (!isoString) return "—";
   try {
     return formatDistanceToNow(parseISO(isoString), { addSuffix: true });
+  } catch {
+    return "—";
+  }
+}
+
+/** Relative freshness in minutes only (for Fear & Greed gauge). */
+export function timeAgoMinutes(isoString: string | null | undefined): string {
+  if (!isoString) return "—";
+  try {
+    const minutes = differenceInMinutes(new Date(), parseISO(isoString));
+    if (minutes < 1) return "just now";
+    return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
   } catch {
     return "—";
   }

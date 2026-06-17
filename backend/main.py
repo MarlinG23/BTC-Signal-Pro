@@ -30,7 +30,7 @@ from database.connection import AsyncSessionLocal, get_db, init_db
 from database.models import Alert, NewsItem, PriceCandle, Signal, TechnicalIndicator
 from indicators.binance_ws import BinanceWebSocketClient
 from indicators.calculator import Candle, IndicatorCalculator, IndicatorSnapshot
-from news.fetcher import NEWS_POLL_INTERVAL_S, NewsFetcher
+from news.fetcher import FEAR_GREED_POLL_INTERVAL_S, NEWS_POLL_INTERVAL_S, NewsFetcher
 from news.filter import FakeNewsFilter
 from news.sentiment import SentimentAnalyzer
 from signals.backtester import BacktestEngine
@@ -54,8 +54,7 @@ fake_news_filter = FakeNewsFilter()
 # Key support/resistance levels (updated periodically via REST endpoint)
 _key_levels: list[float] = []
 
-# Latest Fear & Greed snapshot — updated by the news poll loop so the REST
-# endpoint can serve it immediately without making an outbound request.
+# Latest Fear & Greed snapshot — refreshed hourly by _fear_greed_poll_loop.
 _latest_fear_greed: Optional[dict] = None
 
 # Startup / status tracking
@@ -95,19 +94,8 @@ async def lifespan(app: FastAPI):
     loaded_4h = await binance_ws.preload_4h_candles(limit=200)
     logger.info("Preloaded %d × 4H candles", loaded_4h)
 
-    # 4. Fetch Fear & Greed (wait)
-    try:
-        async with NewsFetcher() as fetcher:
-            fg = await fetcher.fetch_fear_greed()
-        if fg:
-            _latest_fear_greed = {
-                "value": fg.value,
-                "classification": fg.classification,
-                "timestamp": fg.timestamp.isoformat(),
-            }
-            logger.info("Fear & Greed loaded: %d (%s)", fg.value, fg.classification)
-    except Exception as exc:
-        logger.error("Startup Fear & Greed fetch failed: %s", exc)
+    # 4. Fetch Fear & Greed immediately on startup
+    await _refresh_fear_greed()
 
     # 5. Fetch news (wait)
     await _fetch_and_process_news()
@@ -124,6 +112,7 @@ async def lifespan(app: FastAPI):
 
     # 8. Start background loops
     news_task = asyncio.create_task(_news_poll_loop(), name="news-poll")
+    fear_greed_task = asyncio.create_task(_fear_greed_poll_loop(), name="fear-greed-poll")
     fallback_task = asyncio.create_task(_price_fallback_loop(), name="price-fallback")
     outcome_task = asyncio.create_task(_outcome_check_loop(), name="outcome-check")
 
@@ -142,10 +131,14 @@ async def lifespan(app: FastAPI):
     await binance_ws.stop()
     ws_task.cancel()
     news_task.cancel()
+    fear_greed_task.cancel()
     fallback_task.cancel()
     outcome_task.cancel()
     try:
-        await asyncio.gather(ws_task, news_task, fallback_task, outcome_task, return_exceptions=True)
+        await asyncio.gather(
+            ws_task, news_task, fear_greed_task, fallback_task, outcome_task,
+            return_exceptions=True,
+        )
     except Exception:
         pass
     logger.info("Shutdown complete.")
@@ -203,7 +196,7 @@ async def get_system_status(db: AsyncSession = Depends(get_db)):
             logger.debug("Could not fetch last signal for status: %s", exc)
 
     fg_updated = (
-        _latest_fear_greed.get("timestamp") if _latest_fear_greed else None
+        _latest_fear_greed.get("updated_at") if _latest_fear_greed else None
     )
 
     return {
@@ -246,26 +239,13 @@ async def get_indicators_4h():
 async def get_fear_greed():
     """Return the latest Fear & Greed index value.
 
-    Served from an in-memory cache that is populated on the first news poll
-    cycle (at startup).  Returns 503 while the cache is still empty.
+    Served from an in-memory cache refreshed hourly by a dedicated poll loop.
+    Returns 503 while the cache is still empty.
     """
     global _latest_fear_greed  # must be declared before any use in this scope
     if _latest_fear_greed is None:
-        # Cache miss — fetch live so the first page load never shows a spinner
-        try:
-            async with NewsFetcher() as fetcher:
-                fg = await fetcher.fetch_fear_greed()
-            if fg is None:
-                raise HTTPException(status_code=503, detail="Fear & Greed data not yet available.")
-            _latest_fear_greed = {
-                "value": fg.value,
-                "classification": fg.classification,
-                "timestamp": fg.timestamp.isoformat(),
-            }
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.error("Fear & Greed live fetch failed: %s", exc)
+        await _refresh_fear_greed()
+        if _latest_fear_greed is None:
             raise HTTPException(status_code=503, detail="Fear & Greed data not yet available.")
     return _latest_fear_greed
 
@@ -766,6 +746,42 @@ async def _resolve_signal_outcomes() -> None:
         logger.error("Signal outcome resolution failed: %s", exc, exc_info=True)
 
 
+async def _refresh_fear_greed() -> None:
+    """Fetch Fear & Greed index and update in-memory cache + WebSocket clients."""
+    global _latest_fear_greed
+    try:
+        async with NewsFetcher() as fetcher:
+            fg = await fetcher.fetch_fear_greed()
+        if fg is None:
+            return
+        now = datetime.now(timezone.utc)
+        _latest_fear_greed = {
+            "value": fg.value,
+            "classification": fg.classification,
+            "timestamp": fg.timestamp.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        logger.info("F&G refreshed: %d at %s", fg.value, now.isoformat())
+        await alert_manager.ws_broadcaster.broadcast(
+            {"type": "fear_greed", **_latest_fear_greed}
+        )
+    except Exception as exc:
+        logger.error("Fear & Greed refresh failed: %s", exc)
+
+
+async def _fear_greed_poll_loop() -> None:
+    """Background loop: refresh Fear & Greed every hour."""
+    while True:
+        try:
+            await asyncio.sleep(FEAR_GREED_POLL_INTERVAL_S)
+            await _refresh_fear_greed()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("Fear & Greed poll loop error: %s", exc)
+            await asyncio.sleep(60)
+
+
 async def _news_poll_loop() -> None:
     """Background loop: fetch news every 15 minutes."""
     while True:
@@ -784,7 +800,6 @@ async def _fetch_and_process_news() -> None:
     try:
         async with NewsFetcher() as fetcher:
             articles = await fetcher.fetch_all_news()
-            fear_greed = await fetcher.fetch_fear_greed()
             liquidations = await fetcher.fetch_coinglass_liquidations()
 
         if not articles:
@@ -876,19 +891,9 @@ async def _fetch_and_process_news() -> None:
                 short_usd=liquidations.short_liquidations_usd,
             )
 
-        # Cache and broadcast Fear & Greed
-        global _latest_fear_greed, _last_news_fetch, _news_count
+        global _last_news_fetch, _news_count
         _last_news_fetch = datetime.now(timezone.utc)
         _news_count = len(articles)
-        if fear_greed:
-            _latest_fear_greed = {
-                "value": fear_greed.value,
-                "classification": fear_greed.classification,
-                "timestamp": fear_greed.timestamp.isoformat(),
-            }
-            await alert_manager.ws_broadcaster.broadcast(
-                {"type": "fear_greed", **_latest_fear_greed}
-            )
 
     except Exception as exc:
         logger.error("News processing error: %s", exc, exc_info=True)
