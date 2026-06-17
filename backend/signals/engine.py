@@ -404,12 +404,14 @@ class SignalEngine:
         TP distance = max(ATR × 2, 0.5% of entry)
         SL distance = max(ATR × 1, 0.3% of entry)
         """
-        min_tp_dist = entry * 0.005
-        min_sl_dist = entry * 0.003
+        min_tp_dist = entry * 0.005  # 0.5%
+        min_sl_dist = entry * 0.003  # 0.3%
 
         if atr_14 is not None and atr_14 > 0:
-            tp_dist = max(atr_14 * 2, min_tp_dist)
-            sl_dist = max(atr_14 * 1, min_sl_dist)
+            tp_from_atr = atr_14 * 2
+            sl_from_atr = atr_14 * 1
+            tp_dist = max(tp_from_atr, min_tp_dist)
+            sl_dist = max(sl_from_atr, min_sl_dist)
         else:
             tp_dist = min_tp_dist
             sl_dist = min_sl_dist
