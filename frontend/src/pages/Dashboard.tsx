@@ -33,6 +33,7 @@ import { SignalHistory } from "../components/SignalHistory";
 import { BacktestPanel } from "../components/BacktestPanel";
 import { StatusBar } from "../components/StatusBar";
 import { isSignalFresh } from "../utils/signalFreshness";
+import { deriveTrend } from "../utils/trend";
 
 // Sound alert using Web Audio API — plays a short beep on new signal
 function playSignalSound(type: string) {
@@ -80,6 +81,11 @@ export function Dashboard() {
     "/api/fear-greed",
     60_000 // refresh every minute; backend polls hourly
   );
+  const { data: snap4h } = useApi<IndicatorSnapshot>(
+    "/api/indicators/4h",
+    60_000
+  );
+  const trend4h = deriveTrend(snap4h).label;
 
   const nextAlertId = useRef(0);
   const nextNewsId = useRef(-1);
@@ -209,6 +215,7 @@ export function Dashboard() {
             {/* Signal Badge — most prominent element */}
             <SignalBadge
               signal={displaySignal}
+              trend4h={trend4h}
               currentPrice={livePrice}
               atr14={indicators?.atr_14 ?? null}
             />

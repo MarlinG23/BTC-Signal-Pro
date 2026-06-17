@@ -7,6 +7,7 @@ import clsx from "clsx";
 import { IndicatorSnapshot } from "../utils/types";
 import { formatPrice, fmt } from "../utils/format";
 import { useApi } from "../hooks/useApi";
+import { deriveTrend } from "../utils/trend";
 
 interface TrendPanelProps {
   /** 1-minute snapshot for ENTRY context */
@@ -15,24 +16,6 @@ interface TrendPanelProps {
 
 interface Snapshot4H extends IndicatorSnapshot {
   candles_buffered?: number;
-}
-
-function deriveTrend(snap: Snapshot4H | null): {
-  direction: 1 | -1 | 0;
-  label: string;
-  color: string;
-} {
-  if (!snap || snap.close_price == null || snap.ema_20 == null || snap.ema_50 == null) {
-    return { direction: 0, label: "LOADING", color: "text-brand-muted" };
-  }
-  const { close_price: p, ema_20: e20, ema_50: e50, rsi_14: rsi } = snap;
-  if (p > e20 && e20 > e50 && (rsi == null || rsi < 70)) {
-    return { direction: 1, label: "BULLISH", color: "text-emerald-400" };
-  }
-  if (p < e20 && e20 < e50 && (rsi == null || rsi > 30)) {
-    return { direction: -1, label: "BEARISH", color: "text-red-400" };
-  }
-  return { direction: 0, label: "NEUTRAL", color: "text-yellow-400" };
 }
 
 export function TrendPanel({ snapshot1m }: TrendPanelProps) {

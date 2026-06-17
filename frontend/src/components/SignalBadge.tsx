@@ -1,6 +1,6 @@
 /**
  * Prominent animated signal badge displayed at the top of the dashboard.
- * Changes color and animation based on the current signal type.
+ * Shows BUY/SELL only when 1M and 4H agree; WAIT when 4H is neutral.
  */
 
 import { useEffect, useState } from "react";
@@ -8,9 +8,17 @@ import clsx from "clsx";
 import { Signal, SignalType } from "../utils/types";
 import { formatPrice, fmt, timeAgoSeconds } from "../utils/format";
 import { isSignalFresh } from "../utils/signalFreshness";
+import { TrendLabel } from "../utils/trend";
+import {
+  DisplaySignalType,
+  displayToLevelType,
+  resolveDisplayState,
+} from "../utils/signalDisplay";
 
 interface SignalBadgeProps {
   signal: Signal | null;
+  /** 4-hour trend label — gates BUY/SELL vs WAIT. */
+  trend4h: TrendLabel;
   /** Live BTC price from WebSocket — used for current entry and TP/SL. */
   currentPrice: number | null;
   /** Latest ATR(14) from 1M indicators for TP/SL recalculation. */
@@ -39,46 +47,45 @@ function computeLiveLevels(
   return { tp, sl, rr };
 }
 
-const SIGNAL_CONFIG: Record<
-  SignalType,
+const DISPLAY_CONFIG: Record<
+  DisplaySignalType,
   { label: string; colorClass: string; glowClass: string; emoji: string }
 > = {
-  STRONG_BUY: {
-    label: "STRONG BUY",
-    colorClass: "text-emerald-400 border-emerald-500",
-    glowClass: "shadow-[0_0_30px_rgba(16,185,129,0.4)]",
-    emoji: "🚀",
-  },
   BUY: {
     label: "BUY",
     colorClass: "text-green-400 border-green-500",
     glowClass: "shadow-[0_0_20px_rgba(34,197,94,0.3)]",
-    emoji: "📈",
-  },
-  HOLD: {
-    label: "HOLD",
-    colorClass: "text-yellow-400 border-yellow-500",
-    glowClass: "",
-    emoji: "⏸️",
+    emoji: "🟢",
   },
   SELL: {
     label: "SELL",
-    colorClass: "text-orange-400 border-orange-500",
-    glowClass: "shadow-[0_0_20px_rgba(251,146,60,0.3)]",
-    emoji: "📉",
-  },
-  STRONG_SELL: {
-    label: "STRONG SELL",
     colorClass: "text-red-400 border-red-500",
-    glowClass: "shadow-[0_0_30px_rgba(239,68,68,0.4)]",
-    emoji: "💥",
+    glowClass: "shadow-[0_0_20px_rgba(239,68,68,0.3)]",
+    emoji: "🔴",
+  },
+  WAIT: {
+    label: "WAIT",
+    colorClass: "text-yellow-400 border-yellow-500",
+    glowClass: "",
+    emoji: "🟡",
+  },
+  HOLD: {
+    label: "HOLD",
+    colorClass: "text-gray-400 border-gray-500",
+    glowClass: "",
+    emoji: "⚪",
   },
 };
 
-export function SignalBadge({ signal, currentPrice, atr14 }: SignalBadgeProps) {
+export function SignalBadge({
+  signal,
+  trend4h,
+  currentPrice,
+  atr14,
+}: SignalBadgeProps) {
   const [, setTick] = useState(0);
   const fresh = signal != null && isSignalFresh(signal.generated_at);
-  const activeSignal = fresh ? signal : null;
+  const displayState = resolveDisplayState(signal, trend4h);
 
   useEffect(() => {
     if (!fresh) return;
@@ -86,10 +93,10 @@ export function SignalBadge({ signal, currentPrice, atr14 }: SignalBadgeProps) {
     return () => window.clearInterval(id);
   }, [fresh, signal?.generated_at]);
 
-  if (!activeSignal) {
+  if (!signal || !fresh) {
     return (
       <div className="card flex flex-col items-center justify-center py-8 gap-2">
-        <div className="text-4xl">📊</div>
+        <div className="text-4xl">⚪</div>
         <p className="text-brand-muted text-sm">HOLD — no active signal</p>
         <p className="text-brand-muted text-xs">
           {signal && !fresh
@@ -100,20 +107,20 @@ export function SignalBadge({ signal, currentPrice, atr14 }: SignalBadgeProps) {
     );
   }
 
-  const config = SIGNAL_CONFIG[activeSignal.signal_type];
-  const isActionable =
-    activeSignal.signal_type !== "HOLD" && activeSignal.signal_type !== null;
+  const config = DISPLAY_CONFIG[displayState];
+  const isActionable = displayState === "BUY" || displayState === "SELL";
+  const levelType = displayToLevelType(displayState, signal.signal_type);
+  const showLevels = displayState !== "HOLD";
 
-  const liveEntry = currentPrice ?? activeSignal.entry_price;
+  const liveEntry = currentPrice ?? signal.entry_price;
   const liveLevels =
-    liveEntry != null
-      ? computeLiveLevels(liveEntry, atr14, activeSignal.signal_type)
+    liveEntry != null && showLevels
+      ? computeLiveLevels(liveEntry, atr14, levelType)
       : null;
-  const displayTp = liveLevels?.tp ?? activeSignal.take_profit;
-  const displaySl = liveLevels?.sl ?? activeSignal.stop_loss;
-  const displayRr = liveLevels?.rr ?? activeSignal.risk_reward_ratio;
-  const usingLivePrice =
-    currentPrice != null && currentPrice !== activeSignal.entry_price;
+  const displayTp = liveLevels?.tp ?? signal.take_profit;
+  const displaySl = liveLevels?.sl ?? signal.stop_loss;
+  const displayRr = liveLevels?.rr ?? signal.risk_reward_ratio;
+  const usingLivePrice = currentPrice != null && currentPrice !== signal.entry_price;
 
   return (
     <div
@@ -124,7 +131,6 @@ export function SignalBadge({ signal, currentPrice, atr14 }: SignalBadgeProps) {
         isActionable && "animate-pulse_slow"
       )}
     >
-      {/* Main badge */}
       <div className="flex items-center gap-3">
         <span className="text-4xl">{config.emoji}</span>
         <div className="text-center">
@@ -132,19 +138,24 @@ export function SignalBadge({ signal, currentPrice, atr14 }: SignalBadgeProps) {
             {config.label}
           </div>
           <div className="text-brand-muted text-sm mt-1">
-            {activeSignal.confidence.toFixed(1)}% confidence · {activeSignal.indicators_agreed} indicators agreed
+            {signal.confidence.toFixed(1)}% confidence · {signal.indicators_agreed}{" "}
+            indicators agreed
           </div>
+          {displayState === "WAIT" && (
+            <div className="text-yellow-400/90 text-xs mt-1">
+              1M entry ready — 4H trend is {trend4h}
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Price levels — entry anchored to live price when available */}
-      {activeSignal.signal_type !== "HOLD" && (
+      {showLevels && (
         <div className="w-full mt-2 space-y-2 text-center">
           <p className="text-brand-muted text-xs">
-            Signal generated {timeAgoSeconds(activeSignal.generated_at)}
+            Signal generated {timeAgoSeconds(signal.generated_at)}
             {usingLivePrice && (
               <span className="block text-brand-muted/80">
-                Original entry {formatPrice(activeSignal.entry_price)}
+                Original entry {formatPrice(signal.entry_price)}
               </span>
             )}
           </p>
@@ -176,8 +187,7 @@ export function SignalBadge({ signal, currentPrice, atr14 }: SignalBadgeProps) {
         </div>
       )}
 
-      {/* Risk/Reward */}
-      {displayRr != null && displayRr > 0 && (
+      {displayRr != null && displayRr > 0 && showLevels && (
         <div className="text-brand-muted text-sm">
           R:R = <span className="text-brand-blue">{fmt(displayRr, 2)}:1</span>
         </div>
