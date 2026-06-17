@@ -8,7 +8,7 @@ Signal generation rules:
   2. A signal fires only if the absolute vote count >= SIGNAL_MIN_INDICATORS.
   3. Confidence is calculated as a weighted score (0–100%).
   4. Only signals with confidence >= SIGNAL_CONFIDENCE_THRESHOLD are returned.
-  5. Entry, take-profit, and stop-loss are calculated from ATR or band width.
+  5. Entry, take-profit, and stop-loss are calculated from ATR(14).
   6. Risk/reward ratio is computed as |TP - entry| / |entry - SL|.
 """
 
@@ -358,15 +358,9 @@ class SignalEngine:
         # Map to signal type based on net vote count and confidence
         signal_type = self._classify_signal(net_bullish, confidence)
 
-        # Compute price levels
+        # Compute price levels from ATR(14)
         entry = snap.close_price
-        band_width = (
-            (snap.bb_upper - snap.bb_lower) / 2
-            if (snap.bb_upper and snap.bb_lower)
-            else entry * 0.01  # fallback: 1% of price
-        )
-
-        tp, sl = self._compute_levels(signal_type, entry, band_width)
+        tp, sl = self._compute_levels(signal_type, entry, snap.atr_14)
         rr = self._compute_rr(signal_type, entry, tp, sl)
 
         details = json.dumps(
@@ -402,25 +396,32 @@ class SignalEngine:
         return SignalType.HOLD
 
     def _compute_levels(
-        self, signal_type: SignalType, entry: float, band_width: float
+        self, signal_type: SignalType, entry: float, atr_14: Optional[float]
     ) -> tuple[Optional[float], Optional[float]]:
         """
-        Calculate take-profit and stop-loss based on Bollinger Band width.
+        Calculate take-profit and stop-loss from ATR(14).
 
-        Using half the band-width as the base risk unit aligns TP/SL with
-        recent volatility rather than an arbitrary percentage.
+        TP distance = max(ATR × 2, 0.5% of entry)
+        SL distance = max(ATR × 1, 0.3% of entry)
         """
-        unit = band_width  # one ATR-proxy unit
+        min_tp_dist = entry * 0.005  # 0.5%
+        min_sl_dist = entry * 0.003  # 0.3%
 
-        tp_mult = self.TP_MULTIPLIERS.get(signal_type, 2.0)
-        sl_mult = self.SL_MULTIPLIERS.get(signal_type, 1.0)
+        if atr_14 is not None and atr_14 > 0:
+            tp_from_atr = atr_14 * 2
+            sl_from_atr = atr_14 * 1
+            tp_dist = max(tp_from_atr, min_tp_dist)
+            sl_dist = max(sl_from_atr, min_sl_dist)
+        else:
+            tp_dist = min_tp_dist
+            sl_dist = min_sl_dist
 
         if signal_type in (SignalType.STRONG_BUY, SignalType.BUY):
-            tp = round(entry + unit * tp_mult, 2)
-            sl = round(entry - unit * sl_mult, 2)
+            tp = round(entry + tp_dist, 2)
+            sl = round(entry - sl_dist, 2)
         elif signal_type in (SignalType.STRONG_SELL, SignalType.SELL):
-            tp = round(entry - unit * tp_mult, 2)
-            sl = round(entry + unit * sl_mult, 2)
+            tp = round(entry - tp_dist, 2)
+            sl = round(entry + sl_dist, 2)
         else:
             tp = sl = None
 

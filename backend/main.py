@@ -15,6 +15,7 @@ signals, and alerts in real time via a shared broadcaster.
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -29,7 +30,7 @@ from database.connection import AsyncSessionLocal, get_db, init_db
 from database.models import Alert, NewsItem, PriceCandle, Signal, TechnicalIndicator
 from indicators.binance_ws import BinanceWebSocketClient
 from indicators.calculator import Candle, IndicatorCalculator, IndicatorSnapshot
-from news.fetcher import NewsFetcher
+from news.fetcher import FEAR_GREED_POLL_INTERVAL_S, NEWS_POLL_INTERVAL_S, NewsFetcher
 from news.filter import FakeNewsFilter
 from news.sentiment import SentimentAnalyzer
 from signals.backtester import BacktestEngine
@@ -53,9 +54,16 @@ fake_news_filter = FakeNewsFilter()
 # Key support/resistance levels (updated periodically via REST endpoint)
 _key_levels: list[float] = []
 
-# Latest Fear & Greed snapshot — updated by the news poll loop so the REST
-# endpoint can serve it immediately without making an outbound request.
+# Latest Fear & Greed snapshot — refreshed hourly by _fear_greed_poll_loop.
 _latest_fear_greed: Optional[dict] = None
+
+# Startup / status tracking
+_startup_ready = False
+_app_start_time = time.time()
+_db_connected = False
+_last_news_fetch: Optional[datetime] = None
+_news_count = 0
+_last_signal_at: Optional[datetime] = None
 
 
 # ── Application lifespan ──────────────────────────────────────────────────────
@@ -64,43 +72,73 @@ _latest_fear_greed: Optional[dict] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handle startup and shutdown events."""
+    global _startup_ready, _db_connected, _latest_fear_greed
+    global _last_news_fetch, _news_count
+
     logger.info("BTC Signal Pro starting up...")
 
-    # 1. Init DB tables
+    # 1. Connect database
     try:
         await init_db()
+        _db_connected = True
+        logger.info("Database connected.")
     except Exception as exc:
+        _db_connected = False
         logger.error("DB init failed — running without persistence: %s", exc)
 
-    # 2. Register WebSocket callbacks
+    # 2. Preload 300 × 1M candles
+    loaded_1m = await binance_ws.preload_historical_candles(limit=300)
+    logger.info("Preloaded %d × 1M candles", loaded_1m)
+
+    # 3. Preload 200 × 4H candles
+    loaded_4h = await binance_ws.preload_4h_candles(limit=200)
+    logger.info("Preloaded %d × 4H candles", loaded_4h)
+
+    # 4. Fetch Fear & Greed immediately on startup
+    await _refresh_fear_greed()
+
+    # 5. Fetch news (wait)
+    await _fetch_and_process_news()
+
+    # Register WebSocket callbacks
     binance_ws.on_candle_closed(_on_candle_closed)
     binance_ws.on_price_tick(_on_price_tick)
 
-    # 3. Start Binance WebSocket
-    ws_task = asyncio.create_task(binance_ws.run(), name="binance-ws")
+    # 6. Start Binance WebSocket (preload already done above)
+    ws_task = asyncio.create_task(binance_ws.run(skip_preload=True), name="binance-ws")
 
-    # 4. Start news polling (every 5 minutes)
+    # 7. Signal engine is ready (evaluate() runs on each closed candle)
+    logger.info("Signal engine ready.")
+
+    # 8. Start background loops
     news_task = asyncio.create_task(_news_poll_loop(), name="news-poll")
-
-    # 5. Start REST price fallback when Binance WebSocket is geo-blocked/unavailable
+    fear_greed_task = asyncio.create_task(_fear_greed_poll_loop(), name="fear-greed-poll")
     fallback_task = asyncio.create_task(_price_fallback_loop(), name="price-fallback")
-
-    # 6. Start signal outcome checker (runs every 5 minutes)
     outcome_task = asyncio.create_task(_outcome_check_loop(), name="outcome-check")
 
-    logger.info("BTC Signal Pro ready. Listening on %s:%d", settings.APP_HOST, settings.APP_PORT)
+    _startup_ready = True
+    logger.info(
+        "BTC Signal Pro ready. Listening on %s:%d",
+        settings.APP_HOST,
+        settings.APP_PORT,
+    )
 
     yield  # application runs here
 
     # Graceful shutdown
     logger.info("Shutting down...")
+    _startup_ready = False
     await binance_ws.stop()
     ws_task.cancel()
     news_task.cancel()
+    fear_greed_task.cancel()
     fallback_task.cancel()
     outcome_task.cancel()
     try:
-        await asyncio.gather(ws_task, news_task, fallback_task, outcome_task, return_exceptions=True)
+        await asyncio.gather(
+            ws_task, news_task, fear_greed_task, fallback_task, outcome_task,
+            return_exceptions=True,
+        )
     except Exception:
         pass
     logger.info("Shutdown complete.")
@@ -130,11 +168,50 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     """Health check endpoint used by Railway for liveness probes."""
+    if not _startup_ready:
+        raise HTTPException(status_code=503, detail="Service is starting up.")
     return {
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "candles_buffered": calculator.candle_count(),
         "latest_price": binance_ws.latest_price,
+    }
+
+
+@app.get("/api/status")
+async def get_system_status(db: AsyncSession = Depends(get_db)):
+    """Return a full operational health snapshot for the dashboard status bar."""
+    last_signal_iso = _last_signal_at.isoformat() if _last_signal_at else None
+    if last_signal_iso is None and _db_connected:
+        try:
+            from sqlalchemy import select
+
+            result = await db.execute(
+                select(Signal).order_by(Signal.generated_at.desc()).limit(1)
+            )
+            sig = result.scalar_one_or_none()
+            if sig:
+                last_signal_iso = sig.generated_at.isoformat()
+        except Exception as exc:
+            logger.debug("Could not fetch last signal for status: %s", exc)
+
+    fg_updated = (
+        _latest_fear_greed.get("updated_at") if _latest_fear_greed else None
+    )
+
+    return {
+        "candles_1m": calculator.candle_count(),
+        "candles_4h": calculator_4h.candle_count(),
+        "last_news_fetch": _last_news_fetch.isoformat() if _last_news_fetch else None,
+        "news_count": _news_count,
+        "fear_greed": _latest_fear_greed.get("value") if _latest_fear_greed else None,
+        "fear_greed_updated": fg_updated,
+        "ws_connected": binance_ws.ws_connected,
+        "ws_last_message_seconds": binance_ws.ws_last_message_seconds,
+        "last_signal": last_signal_iso,
+        "db_connected": _db_connected,
+        "uptime_seconds": int(time.time() - _app_start_time),
+        "startup_ready": _startup_ready,
     }
 
 
@@ -162,26 +239,13 @@ async def get_indicators_4h():
 async def get_fear_greed():
     """Return the latest Fear & Greed index value.
 
-    Served from an in-memory cache that is populated on the first news poll
-    cycle (at startup).  Returns 503 while the cache is still empty.
+    Served from an in-memory cache refreshed hourly by a dedicated poll loop.
+    Returns 503 while the cache is still empty.
     """
     global _latest_fear_greed  # must be declared before any use in this scope
     if _latest_fear_greed is None:
-        # Cache miss — fetch live so the first page load never shows a spinner
-        try:
-            async with NewsFetcher() as fetcher:
-                fg = await fetcher.fetch_fear_greed()
-            if fg is None:
-                raise HTTPException(status_code=503, detail="Fear & Greed data not yet available.")
-            _latest_fear_greed = {
-                "value": fg.value,
-                "classification": fg.classification,
-                "timestamp": fg.timestamp.isoformat(),
-            }
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.error("Fear & Greed live fetch failed: %s", exc)
+        await _refresh_fear_greed()
+        if _latest_fear_greed is None:
             raise HTTPException(status_code=503, detail="Fear & Greed data not yet available.")
     return _latest_fear_greed
 
@@ -263,7 +327,6 @@ async def get_news(
 
         stmt = (
             select(NewsItem)
-            .where(NewsItem.is_filtered == False)  # noqa: E712
             .order_by(NewsItem.published_at.desc())
             .limit(min(limit, 100))
         )
@@ -683,21 +746,53 @@ async def _resolve_signal_outcomes() -> None:
         logger.error("Signal outcome resolution failed: %s", exc, exc_info=True)
 
 
-async def _news_poll_loop() -> None:
-    """Background loop: fetch news every 5 minutes and process it.
+async def _refresh_fear_greed() -> None:
+    """Fetch Fear & Greed index and update in-memory cache + WebSocket clients."""
+    global _latest_fear_greed
+    try:
+        async with NewsFetcher() as fetcher:
+            fg = await fetcher.fetch_fear_greed()
+        if fg is None:
+            return
+        now = datetime.now(timezone.utc)
+        _latest_fear_greed = {
+            "value": fg.value,
+            "classification": fg.classification,
+            "timestamp": fg.timestamp.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        logger.info("F&G refreshed: %d at %s", fg.value, now.isoformat())
+        await alert_manager.ws_broadcaster.broadcast(
+            {"type": "fear_greed", **_latest_fear_greed}
+        )
+    except Exception as exc:
+        logger.error("Fear & Greed refresh failed: %s", exc)
 
-    Runs immediately on startup so Fear & Greed and news are available
-    as soon as the first client connects.
-    """
+
+async def _fear_greed_poll_loop() -> None:
+    """Background loop: refresh Fear & Greed every hour."""
+    while True:
+        try:
+            await asyncio.sleep(FEAR_GREED_POLL_INTERVAL_S)
+            await _refresh_fear_greed()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("Fear & Greed poll loop error: %s", exc)
+            await asyncio.sleep(60)
+
+
+async def _news_poll_loop() -> None:
+    """Background loop: fetch news every 15 minutes."""
     while True:
         try:
             await _fetch_and_process_news()
-            await asyncio.sleep(300)  # 5 minutes
+            await asyncio.sleep(NEWS_POLL_INTERVAL_S)
         except asyncio.CancelledError:
             break
         except Exception as exc:
             logger.error("News poll loop error: %s", exc)
-            await asyncio.sleep(60)  # back off on error
+            await asyncio.sleep(60)
 
 
 async def _fetch_and_process_news() -> None:
@@ -705,15 +800,13 @@ async def _fetch_and_process_news() -> None:
     try:
         async with NewsFetcher() as fetcher:
             articles = await fetcher.fetch_all_news()
-            fear_greed = await fetcher.fetch_fear_greed()
             liquidations = await fetcher.fetch_coinglass_liquidations()
 
         if not articles:
-            logger.debug("No articles fetched.")
-            return
+            logger.debug("No articles fetched this cycle.")
 
-        # Apply fake-news filter
-        decisions = fake_news_filter.evaluate_batch(articles)
+        # Quality badge (cross-reference) — never blocks publication
+        decisions = fake_news_filter.evaluate_batch(articles) if articles else []
 
         # Process each article
         async with AsyncSessionLocal() as session:
@@ -767,11 +860,8 @@ async def _fetch_and_process_news() -> None:
                 )
                 await session.execute(stmt)
 
-                # Alert on high-impact verified articles
-                if not decision.is_filtered and (
-                    sentiment_result.is_geopolitical
-                    or sentiment_result.sentiment.value != "NEUTRAL"
-                ):
+                # Alert on high-impact articles (quality badge shown via cross_referenced)
+                if sentiment_result.is_geopolitical or sentiment_result.sentiment.value != "NEUTRAL":
                     await alert_manager.fire_news_alert(
                         title=article.title,
                         source=article.source,
@@ -786,10 +876,12 @@ async def _fetch_and_process_news() -> None:
                             "sentiment": sentiment_result.sentiment.value,
                             "score": sentiment_result.score,
                             "is_geopolitical": sentiment_result.is_geopolitical,
+                            "cross_referenced": decision.cross_referenced,
                         }
                     )
 
-            await session.commit()
+            if articles:
+                await session.commit()
 
         # Liquidation alert
         if liquidations:
@@ -799,17 +891,9 @@ async def _fetch_and_process_news() -> None:
                 short_usd=liquidations.short_liquidations_usd,
             )
 
-        # Cache and broadcast Fear & Greed
-        if fear_greed:
-            global _latest_fear_greed
-            _latest_fear_greed = {
-                "value": fear_greed.value,
-                "classification": fear_greed.classification,
-                "timestamp": fear_greed.timestamp.isoformat(),
-            }
-            await alert_manager.ws_broadcaster.broadcast(
-                {"type": "fear_greed", **_latest_fear_greed}
-            )
+        global _last_news_fetch, _news_count
+        _last_news_fetch = datetime.now(timezone.utc)
+        _news_count = len(articles)
 
     except Exception as exc:
         logger.error("News processing error: %s", exc, exc_info=True)
@@ -874,6 +958,7 @@ async def _persist_candle(candle: Candle, snapshot: IndicatorSnapshot) -> None:
 
 async def _persist_signal(signal: SignalResult) -> Optional[int]:
     """Persist a signal to the database. Returns the new row's ID."""
+    global _last_signal_at
     try:
         async with AsyncSessionLocal() as session:
             db_signal = Signal(
@@ -890,6 +975,7 @@ async def _persist_signal(signal: SignalResult) -> Optional[int]:
             await session.flush()
             signal_id = db_signal.id
             await session.commit()
+            _last_signal_at = signal.generated_at
             return signal_id
     except Exception as exc:
         logger.error("Failed to persist signal: %s", exc)
@@ -916,6 +1002,7 @@ def _snapshot_to_dict(snap: IndicatorSnapshot) -> dict:
         "bb_percent_b": snap.bb_percent_b,
         "volume_sma_20": snap.volume_sma_20,
         "volume_ratio": snap.volume_ratio,
+        "atr_14": snap.atr_14,
     }
 
 
@@ -946,6 +1033,7 @@ def _news_to_dict(n: NewsItem) -> dict:
         "sentiment_score": n.sentiment_score,
         "is_geopolitical": n.is_geopolitical,
         "geo_keywords": n.geo_keywords,
+        "cross_referenced": n.cross_referenced,
     }
 
 

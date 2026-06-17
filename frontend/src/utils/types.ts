@@ -31,6 +31,7 @@ export interface IndicatorSnapshot {
   bb_percent_b: number | null;
   volume_sma_20: number | null;
   volume_ratio: number | null;
+  atr_14: number | null;
 }
 
 export interface Signal {
@@ -71,6 +72,23 @@ export interface FearGreedData {
   value: number;
   classification: string;
   timestamp: string;
+  /** When our backend last fetched the index (ISO). Prefer for "Updated …" display. */
+  updated_at?: string;
+}
+
+export interface SystemStatus {
+  candles_1m: number;
+  candles_4h: number;
+  last_news_fetch: string | null;
+  news_count: number;
+  fear_greed: number | null;
+  fear_greed_updated: string | null;
+  ws_connected: boolean;
+  ws_last_message_seconds: number | null;
+  last_signal: string | null;
+  db_connected: boolean;
+  uptime_seconds: number;
+  startup_ready: boolean;
 }
 
 export interface TrendSignal {

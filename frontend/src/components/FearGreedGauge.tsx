@@ -5,7 +5,7 @@
 
 import clsx from "clsx";
 import { FearGreedData } from "../utils/types";
-import { timeAgo } from "../utils/format";
+import { timeAgoMinutes } from "../utils/format";
 
 interface FearGreedGaugeProps {
   data: FearGreedData | null;
@@ -84,7 +84,7 @@ export function FearGreedGauge({ data }: FearGreedGaugeProps) {
             {data.classification}
           </p>
           <p className="text-brand-muted text-xs mt-1">
-            Updated {timeAgo(data.timestamp)}
+            Updated {timeAgoMinutes(data.updated_at ?? data.timestamp)}
           </p>
 
           {/* Scale labels */}

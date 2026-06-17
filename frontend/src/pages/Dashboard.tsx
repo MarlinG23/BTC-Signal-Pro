@@ -31,6 +31,7 @@ import { NewsFeed } from "../components/NewsFeed";
 import { AlertLog } from "../components/AlertLog";
 import { SignalHistory } from "../components/SignalHistory";
 import { BacktestPanel } from "../components/BacktestPanel";
+import { StatusBar } from "../components/StatusBar";
 
 // Sound alert using Web Audio API — plays a short beep on new signal
 function playSignalSound(type: string) {
@@ -76,7 +77,7 @@ export function Dashboard() {
   // Fetch Fear & Greed immediately on page load; WS updates will override
   const { data: initialFearGreed } = useApi<FearGreedData>(
     "/api/fear-greed",
-    300_000 // refresh every 5 minutes to stay in sync with backend poll
+    60_000 // refresh every minute; backend polls hourly
   );
 
   const nextAlertId = useRef(0);
@@ -155,6 +156,7 @@ export function Dashboard() {
           value: msg.value as number,
           classification: msg.classification as string,
           timestamp: msg.timestamp as string,
+          updated_at: msg.updated_at as string | undefined,
         });
         break;
       }
@@ -193,12 +195,18 @@ export function Dashboard() {
           candles={candleCount}
         />
 
+        <StatusBar />
+
         {/* Main grid */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           {/* Left column */}
           <div className="lg:col-span-2 space-y-4">
             {/* Signal Badge — most prominent element */}
-            <SignalBadge signal={displaySignal} />
+            <SignalBadge
+              signal={displaySignal}
+              currentPrice={livePrice}
+              atr14={indicators?.atr_14 ?? null}
+            />
 
             {/* Multi-timeframe: TREND (4H) vs ENTRY (1M) */}
             <TrendPanel snapshot1m={indicators} />

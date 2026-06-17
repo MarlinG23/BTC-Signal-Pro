@@ -71,6 +71,9 @@ class IndicatorSnapshot:
     volume_sma_20: Optional[float] = None
     volume_ratio: Optional[float] = None  # current volume / 20-period SMA
 
+    # ATR
+    atr_14: Optional[float] = None  # Average True Range — used for TP/SL sizing
+
     # Latest close price (always available after first candle)
     close_price: Optional[float] = None
 
@@ -207,5 +210,14 @@ class IndicatorCalculator:
                 snap.volume_ratio = float(df["volume"].iloc[-1]) / snap.volume_sma_20
         except Exception as exc:
             logger.warning("Volume analysis computation error: %s", exc)
+
+        # ── ATR (14-period) ───────────────────────────────────────────────
+        try:
+            atr = ta.volatility.AverageTrueRange(
+                high=df["high"], low=df["low"], close=df["close"], window=14
+            )
+            snap.atr_14 = self._safe_float(atr.average_true_range())
+        except Exception as exc:
+            logger.warning("ATR computation error: %s", exc)
 
         return snap
