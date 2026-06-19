@@ -83,6 +83,7 @@ export interface SystemStatus {
   news_count: number;
   fear_greed: number | null;
   fear_greed_updated: string | null;
+  fear_greed_poll_alive: boolean;
   ws_connected: boolean;
   ws_last_message_seconds: number | null;
   last_signal: string | null;

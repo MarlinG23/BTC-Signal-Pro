@@ -100,9 +100,11 @@ export function StatusBar() {
         />
         <Pill
           label="F&G"
-          ok={status.fear_greed != null}
+          ok={status.fear_greed_poll_alive === true}
           detail={
-            status.fear_greed != null ? String(status.fear_greed) : "—"
+            status.fear_greed != null
+              ? `${status.fear_greed}${status.fear_greed_poll_alive ? "" : " (stale)"}`
+              : "—"
           }
         />
         <Pill

@@ -56,6 +56,8 @@ _key_levels: list[float] = []
 
 # Latest Fear & Greed snapshot — refreshed hourly by _fear_greed_poll_loop.
 _latest_fear_greed: Optional[dict] = None
+_fear_greed_poll_task: Optional[asyncio.Task] = None
+FEAR_GREED_STALE_SECONDS = 70 * 60  # poll alive if updated within 70 min
 
 # Startup / status tracking
 _startup_ready = False
@@ -112,7 +114,16 @@ async def lifespan(app: FastAPI):
 
     # 8. Start background loops
     news_task = asyncio.create_task(_news_poll_loop(), name="news-poll")
-    fear_greed_task = asyncio.create_task(_fear_greed_poll_loop(), name="fear-greed-poll")
+    global _fear_greed_poll_task
+    _fear_greed_poll_task = asyncio.create_task(
+        _fear_greed_poll_loop(), name="fear-greed-poll"
+    )
+    fear_greed_task = _fear_greed_poll_task
+    logger.info(
+        "F&G poll task scheduled (done=%s, cancelled=%s)",
+        _fear_greed_poll_task.done(),
+        _fear_greed_poll_task.cancelled(),
+    )
     fallback_task = asyncio.create_task(_price_fallback_loop(), name="price-fallback")
     outcome_task = asyncio.create_task(_outcome_check_loop(), name="outcome-check")
 
@@ -206,6 +217,7 @@ async def get_system_status(db: AsyncSession = Depends(get_db)):
         "news_count": _news_count,
         "fear_greed": _latest_fear_greed.get("value") if _latest_fear_greed else None,
         "fear_greed_updated": fg_updated,
+        "fear_greed_poll_alive": _fear_greed_poll_alive(),
         "ws_connected": binance_ws.ws_connected,
         "ws_last_message_seconds": binance_ws.ws_last_message_seconds,
         "last_signal": last_signal_iso,
@@ -746,14 +758,18 @@ async def _resolve_signal_outcomes() -> None:
         logger.error("Signal outcome resolution failed: %s", exc, exc_info=True)
 
 
-async def _refresh_fear_greed() -> None:
-    """Fetch Fear & Greed index and update in-memory cache + WebSocket clients."""
+async def _refresh_fear_greed() -> bool:
+    """Fetch Fear & Greed index and update in-memory cache + WebSocket clients.
+
+    Returns True when cache was updated successfully.
+    """
     global _latest_fear_greed
     try:
         async with NewsFetcher() as fetcher:
             fg = await fetcher.fetch_fear_greed()
         if fg is None:
-            return
+            logger.warning("F&G refresh skipped: API returned no data after retries")
+            return False
         now = datetime.now(timezone.utc)
         _latest_fear_greed = {
             "value": fg.value,
@@ -761,24 +777,54 @@ async def _refresh_fear_greed() -> None:
             "timestamp": fg.timestamp.isoformat(),
             "updated_at": now.isoformat(),
         }
-        logger.info("F&G refreshed: %d at %s", fg.value, now.isoformat())
+        logger.info("F&G refreshed: value=%d at %s", fg.value, now.isoformat())
         await alert_manager.ws_broadcaster.broadcast(
             {"type": "fear_greed", **_latest_fear_greed}
         )
+        return True
     except Exception as exc:
-        logger.error("Fear & Greed refresh failed: %s", exc)
+        logger.error("Fear & Greed refresh failed: %s", exc, exc_info=True)
+        return False
+
+
+def _fear_greed_poll_alive() -> bool:
+    """True when the F&G cache was refreshed within the last 70 minutes."""
+    if _latest_fear_greed is None:
+        return False
+    updated_at = _latest_fear_greed.get("updated_at")
+    if not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(updated_at)
+        age_s = (datetime.now(timezone.utc) - updated).total_seconds()
+        return 0 <= age_s < FEAR_GREED_STALE_SECONDS
+    except Exception:
+        return False
 
 
 async def _fear_greed_poll_loop() -> None:
-    """Background loop: refresh Fear & Greed every hour."""
+    """Background loop: refresh Fear & Greed every hour.
+
+    Matches _news_poll_loop structure: fetch first, then sleep (not sleep-first).
+    """
+    logger.info("F&G poll loop started (interval=%ds)", FEAR_GREED_POLL_INTERVAL_S)
     while True:
         try:
-            await asyncio.sleep(FEAR_GREED_POLL_INTERVAL_S)
+            logger.info(
+                "F&G poll tick, next sleep in %ds after refresh",
+                FEAR_GREED_POLL_INTERVAL_S,
+            )
             await _refresh_fear_greed()
+            logger.info(
+                "F&G poll tick complete, sleeping %ds until next iteration",
+                FEAR_GREED_POLL_INTERVAL_S,
+            )
+            await asyncio.sleep(FEAR_GREED_POLL_INTERVAL_S)
         except asyncio.CancelledError:
+            logger.info("F&G poll loop cancelled")
             break
         except Exception as exc:
-            logger.error("Fear & Greed poll loop error: %s", exc)
+            logger.error("Fear & Greed poll loop error: %s", exc, exc_info=True)
             await asyncio.sleep(60)
 
 
