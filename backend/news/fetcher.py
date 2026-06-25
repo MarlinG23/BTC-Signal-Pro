@@ -186,6 +186,44 @@ class NewsFetcher:
                     await asyncio.sleep(RETRY_DELAY_S ** attempt)
         return None
 
+    async def fetch_fear_greed_historical(self, days: int = 30) -> list[dict]:
+        """Fetch historical daily Fear & Greed values from alternative.me.
+
+        Returns a list of dicts: [{"timestamp": datetime, "value": int,
+        "classification": str}, ...] sorted oldest-first.  Returns an empty
+        list if the API is unreachable.
+
+        The alternative.me endpoint honours a ``limit`` parameter equal to
+        the number of daily data points to return (newest-first).
+        """
+        url = f"https://api.alternative.me/fng/?limit={days}&format=json"
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = await self._client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+                entries = []
+                for fg in data.get("data", []):
+                    entries.append(
+                        {
+                            "timestamp": datetime.fromtimestamp(
+                                int(fg["timestamp"]), tz=timezone.utc
+                            ),
+                            "value": int(fg["value"]),
+                            "classification": fg.get("value_classification", ""),
+                        }
+                    )
+                entries.sort(key=lambda e: e["timestamp"])
+                logger.info("Fetched %d historical F&G data points", len(entries))
+                return entries
+            except Exception as exc:
+                logger.warning(
+                    "Historical F&G fetch attempt %d failed: %s", attempt, exc
+                )
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(RETRY_DELAY_S ** attempt)
+        return []
+
     async def fetch_glassnode_price(self) -> Optional[float]:
         """
         Fetch latest BTC close price from Glassnode (requires API key).

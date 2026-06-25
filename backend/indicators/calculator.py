@@ -121,6 +121,15 @@ class IndicatorCalculator:
         """Number of candles currently in the rolling window."""
         return len(self._buffer)
 
+    def reset(self) -> None:
+        """Clear the rolling buffer and cached snapshot.
+
+        Used by the periodic 4H refresh so fresh candles don't pile on top
+        of stale ones and distort indicator calculations.
+        """
+        self._buffer.clear()
+        self._last_snapshot = None
+
     # ── Private helpers ───────────────────────────────────────────────────
 
     def _to_dataframe(self) -> pd.DataFrame:

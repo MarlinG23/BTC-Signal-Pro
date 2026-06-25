@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from alerts.manager import AlertManager, AlertType
 from config import settings
+from database.candle_backfill import backfill_1m_candles
 from database.connection import AsyncSessionLocal, get_db, init_db
 from database.models import Alert, NewsItem, PriceCandle, Signal, TechnicalIndicator
 from indicators.binance_ws import BinanceWebSocketClient
@@ -59,6 +60,10 @@ _latest_fear_greed: Optional[dict] = None
 _fear_greed_poll_task: Optional[asyncio.Task] = None
 FEAR_GREED_STALE_SECONDS = 70 * 60  # poll alive if updated within 70 min
 
+# 4H candle periodic refresh — keeps trend gate current throughout uptime.
+_4h_last_refreshed: Optional[datetime] = None
+_4H_REFRESH_INTERVAL_S = 1800  # 30 minutes
+
 # Startup / status tracking
 _startup_ready = False
 _app_start_time = time.time()
@@ -75,7 +80,7 @@ _last_signal_at: Optional[datetime] = None
 async def lifespan(app: FastAPI):
     """Handle startup and shutdown events."""
     global _startup_ready, _db_connected, _latest_fear_greed
-    global _last_news_fetch, _news_count
+    global _last_news_fetch, _news_count, _4h_last_refreshed
 
     logger.info("BTC Signal Pro starting up...")
 
@@ -95,6 +100,7 @@ async def lifespan(app: FastAPI):
     # 3. Preload 200 × 4H candles
     loaded_4h = await binance_ws.preload_4h_candles(limit=200)
     logger.info("Preloaded %d × 4H candles", loaded_4h)
+    _4h_last_refreshed = datetime.now(timezone.utc)
 
     # 4. Fetch Fear & Greed immediately on startup
     await _refresh_fear_greed()
@@ -124,6 +130,7 @@ async def lifespan(app: FastAPI):
         _fear_greed_poll_task.done(),
         _fear_greed_poll_task.cancelled(),
     )
+    refresh_4h_task = asyncio.create_task(_4h_refresh_loop(), name="4h-refresh")
     fallback_task = asyncio.create_task(_price_fallback_loop(), name="price-fallback")
     outcome_task = asyncio.create_task(_outcome_check_loop(), name="outcome-check")
 
@@ -143,11 +150,13 @@ async def lifespan(app: FastAPI):
     ws_task.cancel()
     news_task.cancel()
     fear_greed_task.cancel()
+    refresh_4h_task.cancel()
     fallback_task.cancel()
     outcome_task.cancel()
     try:
         await asyncio.gather(
-            ws_task, news_task, fear_greed_task, fallback_task, outcome_task,
+            ws_task, news_task, fear_greed_task, refresh_4h_task,
+            fallback_task, outcome_task,
             return_exceptions=True,
         )
     except Exception:
@@ -213,6 +222,7 @@ async def get_system_status(db: AsyncSession = Depends(get_db)):
     return {
         "candles_1m": calculator.candle_count(),
         "candles_4h": calculator_4h.candle_count(),
+        "4h_last_refreshed": _4h_last_refreshed.isoformat() if _4h_last_refreshed else None,
         "last_news_fetch": _last_news_fetch.isoformat() if _last_news_fetch else None,
         "news_count": _news_count,
         "fear_greed": _latest_fear_greed.get("value") if _latest_fear_greed else None,
@@ -391,22 +401,60 @@ async def get_key_levels():
     return {"levels": _key_levels}
 
 
+@app.post("/api/admin/backfill-1m")
+async def admin_backfill_1m(days: int = 30, db: AsyncSession = Depends(get_db)):
+    """Backfill historical 1M candles from Binance REST into PostgreSQL."""
+    if days < 1 or days > 90:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 90.")
+    try:
+        return await backfill_1m_candles(db, days=days)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("1M candle backfill failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="1M candle backfill failed.")
+
+
+@app.post("/api/admin/refresh-4h")
+async def admin_refresh_4h():
+    """Manually trigger a 4H candle refresh (same logic as the 30-minute loop)."""
+    ok = await _refresh_4h_candles()
+    if not ok:
+        raise HTTPException(status_code=503, detail="4H candle refresh failed.")
+    snap = calculator_4h.get_snapshot()
+    return {
+        "refreshed": True,
+        "4h_last_refreshed": _4h_last_refreshed.isoformat() if _4h_last_refreshed else None,
+        "candles_4h": calculator_4h.candle_count(),
+        "latest_close": snap.close_price if snap else None,
+        "latest_timestamp": snap.timestamp.isoformat() if snap and snap.timestamp else None,
+    }
+
+
 @app.get("/api/backtest")
 async def run_backtest(days: int = 30, db: AsyncSession = Depends(get_db)):
     """
     Run a backtest over the last N days of stored candles.
 
-    Returns aggregated performance statistics.
+    Returns aggregated performance statistics for two run modes:
+      - 1M-only       (raw signal engine, no gating)
+      - Full pipeline (1M + 4H trend gate + Fear & Greed filter)
+
+    The gated run mirrors what actually trades live.
     """
     if days < 1 or days > 180:
         raise HTTPException(status_code=400, detail="days must be between 1 and 180.")
 
     try:
+        import httpx
         import pandas as pd
-        from sqlalchemy import select
         from datetime import timedelta
+        from sqlalchemy import select
+        from indicators.binance_ws import REST_BASE_COM, REST_BASE_US, SYMBOL_UPPER
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        # ── Load 1M candles from DB ───────────────────────────────────────
         stmt = (
             select(PriceCandle)
             .where(PriceCandle.open_time >= cutoff)
@@ -434,9 +482,76 @@ async def run_backtest(days: int = 30, db: AsyncSession = Depends(get_db)):
             ]
         ).set_index("timestamp")
 
+        # ── Fetch 4H candles for gated backtest ───────────────────────────
+        # Request enough candles to cover the backtest period plus ~10-day
+        # warmup so EMA-50 is fully initialised before the first signal bar.
+        df_4h: Optional[pd.DataFrame] = None
+        try:
+            limit_4h = min(1000, (days + 10) * 6 + 1)
+            params_4h = {
+                "symbol": SYMBOL_UPPER,
+                "interval": "4h",
+                "limit": limit_4h,
+            }
+            endpoints = (
+                [REST_BASE_US, REST_BASE_COM]
+                if settings.BINANCE_USE_US_ENDPOINT
+                else [REST_BASE_COM, REST_BASE_US]
+            )
+            for base in endpoints:
+                try:
+                    async with httpx.AsyncClient(timeout=15) as client:
+                        resp = await client.get(
+                            f"{base}/api/v3/klines", params=params_4h
+                        )
+                        resp.raise_for_status()
+                        klines_4h = resp.json()
+                    rows_4h = [
+                        {
+                            "timestamp": pd.Timestamp(k[0], unit="ms", tz="UTC"),
+                            "open": float(k[1]),
+                            "high": float(k[2]),
+                            "low": float(k[3]),
+                            "close": float(k[4]),
+                            "volume": float(k[7]),
+                        }
+                        for k in klines_4h[:-1]  # skip the still-open candle
+                    ]
+                    df_4h = pd.DataFrame(rows_4h).set_index("timestamp")
+                    logger.info(
+                        "Backtest: fetched %d × 4H candles from %s", len(df_4h), base
+                    )
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "Backtest 4H fetch failed from %s: %s", base, exc
+                    )
+        except Exception as exc:
+            logger.warning("Could not fetch 4H candles for backtest: %s", exc)
+
+        # ── Fetch historical Fear & Greed ─────────────────────────────────
+        fg_history: Optional[list] = None
+        try:
+            async with NewsFetcher() as fetcher:
+                fg_history = await fetcher.fetch_fear_greed_historical(
+                    days=days + 2  # tiny buffer for timezone edge cases
+                )
+            logger.info(
+                "Backtest: fetched %d historical F&G data points",
+                len(fg_history) if fg_history else 0,
+            )
+        except Exception as exc:
+            logger.warning("Could not fetch historical F&G for backtest: %s", exc)
+
+        # ── Run backtest ──────────────────────────────────────────────────
         engine = BacktestEngine()
-        backtest_result = engine.run(df)
-        return {**backtest_result.to_dict(), "candles_used": len(df)}
+        backtest_result = engine.run(df, df_4h=df_4h, fg_history=fg_history)
+        return {
+            **backtest_result.to_dict(),
+            "candles_used": len(df),
+            "4h_candles_used": len(df_4h) if df_4h is not None else 0,
+            "fg_days_used": len(fg_history) if fg_history else 0,
+        }
 
     except HTTPException:
         raise
@@ -800,6 +915,56 @@ def _fear_greed_poll_alive() -> bool:
         return 0 <= age_s < FEAR_GREED_STALE_SECONDS
     except Exception:
         return False
+
+
+async def _refresh_4h_candles() -> bool:
+    """Re-fetch the latest 200 × 4H candles from Binance REST and reload
+    the 4H indicator calculator so the trend gate always uses fresh data.
+
+    The calculator is reset first to avoid pushing duplicates on top of the
+    existing buffer, which would distort EMA/RSI calculations.
+
+    Returns True on success.
+    """
+    global _4h_last_refreshed
+    try:
+        calculator_4h.reset()
+        loaded = await binance_ws.preload_4h_candles(limit=200)
+        if loaded > 0:
+            snap = calculator_4h.get_snapshot()
+            latest_close = snap.close_price if snap else None
+            latest_ts = snap.timestamp if snap else None
+            logger.info(
+                "4H candles refreshed: latest close=%.2f at %s",
+                latest_close or 0.0,
+                latest_ts,
+            )
+            _4h_last_refreshed = datetime.now(timezone.utc)
+            return True
+        logger.warning("4H candle refresh returned 0 candles — keeping stale data")
+        return False
+    except Exception as exc:
+        logger.error("4H candle refresh failed: %s", exc, exc_info=True)
+        return False
+
+
+async def _4h_refresh_loop() -> None:
+    """Background loop: refresh 4H candles every 30 minutes.
+
+    Sleeps first so the startup preload is not immediately duplicated.
+    On failure the loop logs and retries after 60 s rather than crashing.
+    """
+    logger.info("4H refresh loop started (interval=%ds)", _4H_REFRESH_INTERVAL_S)
+    while True:
+        try:
+            await asyncio.sleep(_4H_REFRESH_INTERVAL_S)
+            await _refresh_4h_candles()
+        except asyncio.CancelledError:
+            logger.info("4H refresh loop cancelled")
+            break
+        except Exception as exc:
+            logger.error("4H refresh loop error: %s", exc, exc_info=True)
+            await asyncio.sleep(60)
 
 
 async def _fear_greed_poll_loop() -> None:
