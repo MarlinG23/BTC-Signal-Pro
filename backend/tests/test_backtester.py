@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
 
-from signals.backtester import BacktestEngine, Trade, BacktestResult
+from signals.backtester import BacktestEngine, BacktestOptions, Trade, BacktestResult
 from signals.engine import SignalType
 
 
@@ -135,3 +135,17 @@ class TestBacktestTrades:
                     assert trade.pnl_pct > 0, "TP-hit long trade should be positive"
                 elif trade.exit_reason == "SL_HIT":
                     assert trade.pnl_pct <= 0, "SL-hit long trade should be non-positive"
+
+    def test_taker_fee_reduces_pnl(self):
+        np.random.seed(7)
+        df = _make_ohlcv_dataframe(300, trend="up")
+        no_fee = BacktestEngine().run(df)
+        with_fee = BacktestEngine().run(
+            df,
+            options=BacktestOptions(taker_fee_pct=0.04, gate_mode="none"),
+        )
+        if no_fee.total_trades > 0 and with_fee.total_trades > 0:
+            assert with_fee.total_return_pct < no_fee.total_return_pct
+            assert with_fee.total_return_pct_gross == pytest.approx(
+                no_fee.total_return_pct, rel=1e-6
+            )

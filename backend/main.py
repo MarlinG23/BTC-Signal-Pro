@@ -34,8 +34,9 @@ from indicators.calculator import Candle, IndicatorCalculator, IndicatorSnapshot
 from news.fetcher import FEAR_GREED_POLL_INTERVAL_S, NEWS_POLL_INTERVAL_S, NewsFetcher
 from news.filter import FakeNewsFilter
 from news.sentiment import SentimentAnalyzer
-from signals.backtester import BacktestEngine
+from signals.backtester import BacktestEngine, BacktestOptions
 from signals.engine import SignalEngine, SignalResult
+from signals.param_sweep import run_param_sweep, run_quality_sweep
 
 logging.basicConfig(
     level=logging.DEBUG if not settings.is_production else logging.INFO,
@@ -60,9 +61,15 @@ _latest_fear_greed: Optional[dict] = None
 _fear_greed_poll_task: Optional[asyncio.Task] = None
 FEAR_GREED_STALE_SECONDS = 70 * 60  # poll alive if updated within 70 min
 
-# 4H candle periodic refresh — keeps trend gate current throughout uptime.
+# 4H candle periodic refresh — REST safety net; live updates come from kline_4h WS.
 _4h_last_refreshed: Optional[datetime] = None
-_4H_REFRESH_INTERVAL_S = 1800  # 30 minutes
+_4H_REFRESH_INTERVAL_S = 300  # 5 minutes (backup resync only)
+
+# Research param-sweep job state (in-memory, single process)
+_sweep_task: Optional[asyncio.Task] = None
+_sweep_result: Optional[dict] = None
+_sweep_error: Optional[str] = None
+_sweep_running = False
 
 # Startup / status tracking
 _startup_ready = False
@@ -110,6 +117,7 @@ async def lifespan(app: FastAPI):
 
     # Register WebSocket callbacks
     binance_ws.on_candle_closed(_on_candle_closed)
+    binance_ws.on_4h_candle_closed(_on_4h_candle_closed)
     binance_ws.on_price_tick(_on_price_tick)
 
     # 6. Start Binance WebSocket (preload already done above)
@@ -417,7 +425,7 @@ async def admin_backfill_1m(days: int = 30, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/admin/refresh-4h")
 async def admin_refresh_4h():
-    """Manually trigger a 4H candle refresh (same logic as the 30-minute loop)."""
+    """Manually trigger a 4H REST resync (WebSocket delivers closes in real time)."""
     ok = await _refresh_4h_candles()
     if not ok:
         raise HTTPException(status_code=503, detail="4H candle refresh failed.")
@@ -431,126 +439,211 @@ async def admin_refresh_4h():
     }
 
 
+@app.post("/api/admin/quick-sweep")
+async def admin_quick_sweep(
+    days: int = 30,
+    taker_fee_pct: float = 0.04,
+    async_run: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """Run all 7 quality scenarios in one server-side pass.
+
+    With ``async_run=true`` (recommended on Railway) returns immediately;
+    poll ``GET /api/admin/param-sweep/status`` for results (~3-5 min compute).
+    """
+    global _sweep_task, _sweep_running, _sweep_result, _sweep_error
+    if days < 1 or days > 90:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 90.")
+    if async_run:
+        if _sweep_running:
+            return {"status": "running", "poll": "/api/admin/param-sweep/status"}
+        _sweep_result = None
+        _sweep_error = None
+        _sweep_running = True
+
+        async def _job() -> None:
+            global _sweep_result, _sweep_error, _sweep_running
+            try:
+                async with AsyncSessionLocal() as session:
+                    frames = await _load_backtest_frames(days, session)
+                loop = asyncio.get_running_loop()
+                _sweep_result = await loop.run_in_executor(
+                    None,
+                    lambda: run_quality_sweep(
+                        frames["df"],
+                        frames["df_4h"],
+                        frames["fg_history"],
+                        days=days,
+                        fee_pct=taker_fee_pct,
+                    ),
+                )
+            except Exception as exc:
+                logger.error("Background quick sweep failed: %s", exc, exc_info=True)
+                _sweep_error = str(exc)
+            finally:
+                _sweep_running = False
+
+        _sweep_task = asyncio.create_task(_job(), name="quick-sweep")
+        return {"status": "started", "poll": "/api/admin/param-sweep/status"}
+
+    try:
+        frames = await _load_backtest_frames(days, db)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: run_quality_sweep(
+                frames["df"],
+                frames["df_4h"],
+                frames["fg_history"],
+                days=days,
+                fee_pct=taker_fee_pct,
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Quick sweep failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Quick sweep failed.")
+
+
+@app.post("/api/admin/param-sweep")
+async def admin_param_sweep(
+    days: int = 30,
+    taker_fee_pct: float = 0.04,
+    isolated_only: bool = False,
+    combos_only: bool = False,
+    async_run: bool = True,
+    db: AsyncSession = Depends(get_db),
+):
+    """Research-only parameter sweep over stored candles (not live trading).
+
+    When ``async_run=true`` (default) the sweep runs in a background task;
+    poll ``GET /api/admin/param-sweep/status`` for results.
+    """
+    global _sweep_task, _sweep_running, _sweep_result, _sweep_error
+    if days < 1 or days > 90:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 90.")
+    if isolated_only and combos_only:
+        raise HTTPException(
+            status_code=400,
+            detail="Use isolated_only or combos_only, not both.",
+        )
+    if async_run:
+        if _sweep_running:
+            return {"status": "running", "message": "Sweep already in progress."}
+        _sweep_result = None
+        _sweep_error = None
+        _sweep_running = True
+
+        async def _job() -> None:
+            global _sweep_result, _sweep_error, _sweep_running
+            try:
+                async with AsyncSessionLocal() as session:
+                    frames = await _load_backtest_frames(days, session)
+                loop = asyncio.get_running_loop()
+                _sweep_result = await loop.run_in_executor(
+                    None,
+                    lambda: run_param_sweep(
+                        frames["df"],
+                        frames["df_4h"],
+                        frames["fg_history"],
+                        days=days,
+                        fee_pct=taker_fee_pct,
+                        isolated_only=isolated_only,
+                        combos_only=combos_only,
+                    ),
+                )
+            except Exception as exc:
+                logger.error("Background param sweep failed: %s", exc, exc_info=True)
+                _sweep_error = str(exc)
+            finally:
+                _sweep_running = False
+
+        _sweep_task = asyncio.create_task(_job(), name="param-sweep")
+        return {"status": "started", "poll": "/api/admin/param-sweep/status"}
+
+    try:
+        frames = await _load_backtest_frames(days, db)
+        return run_param_sweep(
+            frames["df"],
+            frames["df_4h"],
+            frames["fg_history"],
+            days=days,
+            fee_pct=taker_fee_pct,
+            isolated_only=isolated_only,
+            combos_only=combos_only,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Param sweep failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Param sweep failed.")
+
+
+@app.get("/api/admin/param-sweep/status")
+async def admin_param_sweep_status():
+    """Poll background param-sweep job status and results."""
+    if _sweep_running:
+        return {"status": "running"}
+    if _sweep_error:
+        return {"status": "error", "error": _sweep_error}
+    if _sweep_result:
+        return {"status": "complete", "result": _sweep_result}
+    return {"status": "idle"}
+
+
 @app.get("/api/backtest")
-async def run_backtest(days: int = 30, db: AsyncSession = Depends(get_db)):
+async def run_backtest(
+    days: int = 30,
+    taker_fee_pct: float = 0.0,
+    gate_mode: str = "full",
+    confidence_threshold: float = 70.0,
+    min_indicators: int = 3,
+    min_tp_pct: float = 0.005,
+    min_sl_pct: float = 0.003,
+    db: AsyncSession = Depends(get_db),
+):
     """
     Run a backtest over the last N days of stored candles.
 
-    Returns aggregated performance statistics for two run modes:
-      - 1M-only       (raw signal engine, no gating)
-      - Full pipeline (1M + 4H trend gate + Fear & Greed filter)
-
-    The gated run mirrors what actually trades live.
+    Returns 1M-only and gated metrics. Research params do not affect live engine.
     """
     if days < 1 or days > 180:
         raise HTTPException(status_code=400, detail="days must be between 1 and 180.")
+    if gate_mode not in ("full", "4h_only", "fg_only", "none"):
+        raise HTTPException(status_code=400, detail="Invalid gate_mode.")
 
     try:
-        import httpx
-        import pandas as pd
-        from datetime import timedelta
-        from sqlalchemy import select
-        from indicators.binance_ws import REST_BASE_COM, REST_BASE_US, SYMBOL_UPPER
+        frames = await _load_backtest_frames(days, db)
+        df = frames["df"]
+        df_4h = frames["df_4h"]
+        fg_history = frames["fg_history"]
 
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-
-        # ── Load 1M candles from DB ───────────────────────────────────────
-        stmt = (
-            select(PriceCandle)
-            .where(PriceCandle.open_time >= cutoff)
-            .order_by(PriceCandle.open_time.asc())
+        options = BacktestOptions(
+            taker_fee_pct=taker_fee_pct,
+            gate_mode=gate_mode,  # type: ignore[arg-type]
+            confidence_threshold=confidence_threshold,
+            min_indicators=min_indicators,
+            min_tp_pct=min_tp_pct,
+            min_sl_pct=min_sl_pct,
         )
-        result = await db.execute(stmt)
-        candles = result.scalars().all()
-
-        if not candles:
-            raise HTTPException(
-                status_code=404, detail=f"No candles found for the last {days} days."
-            )
-
-        df = pd.DataFrame(
-            [
-                {
-                    "timestamp": c.open_time,
-                    "open": float(c.open_price),
-                    "high": float(c.high_price),
-                    "low": float(c.low_price),
-                    "close": float(c.close_price),
-                    "volume": float(c.volume),
-                }
-                for c in candles
-            ]
-        ).set_index("timestamp")
-
-        # ── Fetch 4H candles for gated backtest ───────────────────────────
-        # Request enough candles to cover the backtest period plus ~10-day
-        # warmup so EMA-50 is fully initialised before the first signal bar.
-        df_4h: Optional[pd.DataFrame] = None
-        try:
-            limit_4h = min(1000, (days + 10) * 6 + 1)
-            params_4h = {
-                "symbol": SYMBOL_UPPER,
-                "interval": "4h",
-                "limit": limit_4h,
-            }
-            endpoints = (
-                [REST_BASE_US, REST_BASE_COM]
-                if settings.BINANCE_USE_US_ENDPOINT
-                else [REST_BASE_COM, REST_BASE_US]
-            )
-            for base in endpoints:
-                try:
-                    async with httpx.AsyncClient(timeout=15) as client:
-                        resp = await client.get(
-                            f"{base}/api/v3/klines", params=params_4h
-                        )
-                        resp.raise_for_status()
-                        klines_4h = resp.json()
-                    rows_4h = [
-                        {
-                            "timestamp": pd.Timestamp(k[0], unit="ms", tz="UTC"),
-                            "open": float(k[1]),
-                            "high": float(k[2]),
-                            "low": float(k[3]),
-                            "close": float(k[4]),
-                            "volume": float(k[7]),
-                        }
-                        for k in klines_4h[:-1]  # skip the still-open candle
-                    ]
-                    df_4h = pd.DataFrame(rows_4h).set_index("timestamp")
-                    logger.info(
-                        "Backtest: fetched %d × 4H candles from %s", len(df_4h), base
-                    )
-                    break
-                except Exception as exc:
-                    logger.warning(
-                        "Backtest 4H fetch failed from %s: %s", base, exc
-                    )
-        except Exception as exc:
-            logger.warning("Could not fetch 4H candles for backtest: %s", exc)
-
-        # ── Fetch historical Fear & Greed ─────────────────────────────────
-        fg_history: Optional[list] = None
-        try:
-            async with NewsFetcher() as fetcher:
-                fg_history = await fetcher.fetch_fear_greed_historical(
-                    days=days + 2  # tiny buffer for timezone edge cases
-                )
-            logger.info(
-                "Backtest: fetched %d historical F&G data points",
-                len(fg_history) if fg_history else 0,
-            )
-        except Exception as exc:
-            logger.warning("Could not fetch historical F&G for backtest: %s", exc)
-
-        # ── Run backtest ──────────────────────────────────────────────────
-        engine = BacktestEngine()
-        backtest_result = engine.run(df, df_4h=df_4h, fg_history=fg_history)
+        loop = asyncio.get_running_loop()
+        backtest_result = await loop.run_in_executor(
+            None,
+            lambda: BacktestEngine().run(
+                df, df_4h=df_4h, fg_history=fg_history, options=options
+            ),
+        )
         return {
             **backtest_result.to_dict(),
             "candles_used": len(df),
             "4h_candles_used": len(df_4h) if df_4h is not None else 0,
             "fg_days_used": len(fg_history) if fg_history else 0,
+            "gate_mode": gate_mode,
+            "confidence_threshold": confidence_threshold,
+            "min_indicators": min_indicators,
+            "min_tp_pct": min_tp_pct,
+            "min_sl_pct": min_sl_pct,
         }
 
     except HTTPException:
@@ -558,6 +651,91 @@ async def run_backtest(days: int = 30, db: AsyncSession = Depends(get_db)):
     except Exception as exc:
         logger.error("Backtest failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Backtest failed.")
+
+
+async def _load_backtest_frames(days: int, db: AsyncSession) -> dict:
+    """Load 1M candles from DB plus 4H/F&G from external APIs."""
+    import httpx
+    import pandas as pd
+    from datetime import timedelta
+    from sqlalchemy import select
+    from indicators.binance_ws import REST_BASE_COM, REST_BASE_US, SYMBOL_UPPER
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    stmt = (
+        select(PriceCandle)
+        .where(PriceCandle.open_time >= cutoff)
+        .order_by(PriceCandle.open_time.asc())
+    )
+    result = await db.execute(stmt)
+    candles = result.scalars().all()
+
+    if not candles:
+        raise HTTPException(
+            status_code=404, detail=f"No candles found for the last {days} days."
+        )
+
+    df = pd.DataFrame(
+        [
+            {
+                "timestamp": c.open_time,
+                "open": float(c.open_price),
+                "high": float(c.high_price),
+                "low": float(c.low_price),
+                "close": float(c.close_price),
+                "volume": float(c.volume),
+            }
+            for c in candles
+        ]
+    ).set_index("timestamp")
+
+    df_4h: Optional[pd.DataFrame] = None
+    try:
+        limit_4h = min(1000, (days + 10) * 6 + 1)
+        params_4h = {
+            "symbol": SYMBOL_UPPER,
+            "interval": "4h",
+            "limit": limit_4h,
+        }
+        endpoints = (
+            [REST_BASE_US, REST_BASE_COM]
+            if settings.BINANCE_USE_US_ENDPOINT
+            else [REST_BASE_COM, REST_BASE_US]
+        )
+        for base in endpoints:
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(
+                        f"{base}/api/v3/klines", params=params_4h
+                    )
+                    resp.raise_for_status()
+                    klines_4h = resp.json()
+                rows_4h = [
+                    {
+                        "timestamp": pd.Timestamp(k[0], unit="ms", tz="UTC"),
+                        "open": float(k[1]),
+                        "high": float(k[2]),
+                        "low": float(k[3]),
+                        "close": float(k[4]),
+                        "volume": float(k[7]),
+                    }
+                    for k in klines_4h[:-1]
+                ]
+                df_4h = pd.DataFrame(rows_4h).set_index("timestamp")
+                break
+            except Exception as exc:
+                logger.warning("Backtest 4H fetch failed from %s: %s", base, exc)
+    except Exception as exc:
+        logger.warning("Could not fetch 4H candles for backtest: %s", exc)
+
+    fg_history: Optional[list] = None
+    try:
+        async with NewsFetcher() as fetcher:
+            fg_history = await fetcher.fetch_fear_greed_historical(days=days + 2)
+    except Exception as exc:
+        logger.warning("Could not fetch historical F&G for backtest: %s", exc)
+
+    return {"df": df, "df_4h": df_4h, "fg_history": fg_history}
 
 
 # ── WebSocket Endpoint ────────────────────────────────────────────────────────
@@ -636,6 +814,18 @@ def _get_4h_trend_direction() -> int:
     if p < e20 < e50 and (rsi is None or rsi > 30):
         return -1
     return 0
+
+
+async def _on_4h_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None:
+    """Trend timeframe updated live — no waiting for REST poll."""
+    global _4h_last_refreshed
+    _4h_last_refreshed = datetime.now(timezone.utc)
+    trend = _get_4h_trend_direction()
+    logger.info(
+        "4H trend live update: close=%.2f direction=%+d",
+        candle.close,
+        trend,
+    )
 
 
 async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None:
@@ -949,10 +1139,10 @@ async def _refresh_4h_candles() -> bool:
 
 
 async def _4h_refresh_loop() -> None:
-    """Background loop: refresh 4H candles every 30 minutes.
+    """Background loop: REST resync of 4H candles every 5 minutes.
 
-    Sleeps first so the startup preload is not immediately duplicated.
-    On failure the loop logs and retries after 60 s rather than crashing.
+    Primary updates arrive via the kline_4h WebSocket stream on each close.
+    This loop catches drift after reconnects or missed events.
     """
     logger.info("4H refresh loop started (interval=%ds)", _4H_REFRESH_INTERVAL_S)
     while True:

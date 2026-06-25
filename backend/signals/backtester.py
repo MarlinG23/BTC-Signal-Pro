@@ -29,7 +29,7 @@ import bisect
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -41,6 +41,21 @@ logger = logging.getLogger(__name__)
 
 # Max candles to hold a trade before force-exiting
 DEFAULT_MAX_HOLD_BARS = 60  # 60 minutes
+DEFAULT_TAKER_FEE_PCT = 0.04  # per side (entry + exit)
+
+GateMode = Literal["full", "4h_only", "fg_only", "none"]
+
+
+@dataclass
+class BacktestOptions:
+    """Research-only overrides — does not affect the live SignalEngine."""
+
+    taker_fee_pct: float = 0.0  # per side; 0.04 = 0.04% taker fee each way
+    gate_mode: GateMode = "full"
+    confidence_threshold: float = 70.0
+    min_indicators: int = 3
+    min_tp_pct: float = 0.005  # 0.5% minimum TP distance
+    min_sl_pct: float = 0.003  # 0.3% minimum SL distance
 
 
 @dataclass
@@ -57,6 +72,7 @@ class Trade:
     exit_time: Optional[datetime] = None
     exit_reason: str = ""  # TP_HIT | SL_HIT | TIMEOUT
     pnl_pct: Optional[float] = None
+    pnl_pct_gross: Optional[float] = None
     is_winner: Optional[bool] = None
 
 
@@ -82,6 +98,8 @@ class BacktestResult:
     max_drawdown_pct: float = 0.0
     sharpe_proxy: float = 0.0
     total_return_pct: float = 0.0
+    total_return_pct_gross: float = 0.0
+    taker_fee_pct: float = 0.0
     trades: list[Trade] = field(default_factory=list)
 
     # ── Full pipeline (1M + 4H trend gate + F&G filter) ───────────────────
@@ -97,6 +115,7 @@ class BacktestResult:
     gated_max_drawdown_pct: float = 0.0
     gated_sharpe_proxy: float = 0.0
     gated_total_return_pct: float = 0.0
+    gated_total_return_pct_gross: float = 0.0
     signals_blocked_by_4h_trend: int = 0
     signals_blocked_by_fg: int = 0
 
@@ -111,6 +130,8 @@ class BacktestResult:
             "max_drawdown_pct": round(self.max_drawdown_pct, 4),
             "sharpe_proxy": round(self.sharpe_proxy, 4),
             "total_return_pct": round(self.total_return_pct, 4),
+            "total_return_pct_gross": round(self.total_return_pct_gross, 4),
+            "taker_fee_pct_per_side": self.taker_fee_pct,
         }
         if self.has_gated_run:
             d["gated"] = {
@@ -125,10 +146,32 @@ class BacktestResult:
                 "max_drawdown_pct": round(self.gated_max_drawdown_pct, 4),
                 "sharpe_proxy": round(self.gated_sharpe_proxy, 4),
                 "total_return_pct": round(self.gated_total_return_pct, 4),
+                "total_return_pct_gross": round(self.gated_total_return_pct_gross, 4),
                 "signals_blocked_by_4h_trend": self.signals_blocked_by_4h_trend,
                 "signals_blocked_by_fg": self.signals_blocked_by_fg,
             }
         return d
+
+    @staticmethod
+    def metrics_dict(result: "BacktestResult", *, gated: bool = False) -> dict:
+        """Compact metrics for sweep reporting."""
+        if gated:
+            return {
+                "total_signals": result.gated_total_signals,
+                "total_trades": result.gated_total_trades,
+                "win_rate_pct": round(result.gated_win_rate_pct, 2),
+                "profit_factor": round(result.gated_profit_factor, 4),
+                "total_return_pct": round(result.gated_total_return_pct, 4),
+                "total_return_pct_gross": round(result.gated_total_return_pct_gross, 4),
+            }
+        return {
+            "total_signals": result.total_signals,
+            "total_trades": result.total_trades,
+            "win_rate_pct": round(result.win_rate_pct, 2),
+            "profit_factor": round(result.profit_factor, 4),
+            "total_return_pct": round(result.total_return_pct, 4),
+            "total_return_pct_gross": round(result.total_return_pct_gross, 4),
+        }
 
 
 class BacktestEngine:
@@ -156,6 +199,7 @@ class BacktestEngine:
         df: pd.DataFrame,
         df_4h: Optional[pd.DataFrame] = None,
         fg_history: Optional[list] = None,
+        options: Optional[BacktestOptions] = None,
     ) -> BacktestResult:
         """
         Execute a full backtest on the provided OHLCV DataFrame.
@@ -165,19 +209,36 @@ class BacktestEngine:
         at that point in time.
 
         When df_4h and/or fg_history are provided a second gated pass is
-        run after the 1M-only pass, applying the 4H trend gate and the
-        Fear & Greed filter exactly as the live pipeline does.
+        run after the 1M-only pass, applying gates per ``options.gate_mode``.
         """
+        opts = options or BacktestOptions()
+
         if df.empty:
             logger.warning("Backtest called with empty DataFrame.")
             return BacktestResult()
 
+        df, signals_fired = self.collect_signals(df, opts)
+        return self.run_from_signals(df, signals_fired, df_4h, fg_history, opts)
+
+    def collect_signals(
+        self,
+        df: pd.DataFrame,
+        options: Optional[BacktestOptions] = None,
+    ) -> tuple[pd.DataFrame, list[tuple[int, SignalResult]]]:
+        """Run the 1M replay once and return validated df + raw signal list."""
+        opts = options or BacktestOptions()
+        if df.empty:
+            return df, []
+
         df = self._validate_dataframe(df)
         calculator = IndicatorCalculator()
-        engine = SignalEngine()
-
-        signals_fired: list[tuple[int, SignalResult]] = []  # (bar_index, signal)
-
+        engine = SignalEngine(
+            confidence_threshold=opts.confidence_threshold,
+            min_indicators=opts.min_indicators,
+            min_tp_pct=opts.min_tp_pct,
+            min_sl_pct=opts.min_sl_pct,
+        )
+        signals_fired: list[tuple[int, SignalResult]] = []
         for i, (timestamp, row) in enumerate(df.iterrows()):
             candle = Candle(
                 timestamp=timestamp,
@@ -191,18 +252,45 @@ class BacktestEngine:
             signal = engine.evaluate(snapshot)
             if signal and signal.signal_type != SignalType.HOLD:
                 signals_fired.append((i, signal))
-                logger.debug(
-                    "Backtest signal at bar %d: %s conf=%.1f%%",
-                    i, signal.signal_type.value, signal.confidence
-                )
+        return df, signals_fired
 
-        trades = self._simulate_trades(df, signals_fired)
+    def run_from_signals(
+        self,
+        df: pd.DataFrame,
+        signals_fired: list[tuple[int, SignalResult]],
+        df_4h: Optional[pd.DataFrame] = None,
+        fg_history: Optional[list] = None,
+        options: Optional[BacktestOptions] = None,
+        *,
+        _trend_cache: Optional[tuple[dict, list]] = None,
+        _fg_cache: Optional[tuple[dict, list]] = None,
+    ) -> BacktestResult:
+        """Simulate trades from pre-collected signals (for sweep performance)."""
+        opts = options or BacktestOptions()
+        round_trip_fee = opts.taker_fee_pct * 2
+
+        trades = self._simulate_trades(df, signals_fired, round_trip_fee)
         result = self._compute_metrics(trades, len(signals_fired))
+        result.taker_fee_pct = opts.taker_fee_pct
 
-        # ── Gated pass: apply 4H trend + F&G filters ─────────────────────
-        if df_4h is not None or fg_history is not None:
-            trend_timeline, trend_ts = self._build_4h_trend_timeline(df_4h) if df_4h is not None else ({}, [])
-            fg_lookup, fg_dates = self._build_fg_lookup(fg_history) if fg_history is not None else ({}, [])
+        run_gated = (
+            opts.gate_mode != "none"
+            and (df_4h is not None or fg_history is not None)
+        )
+        if run_gated:
+            if _trend_cache is not None:
+                trend_timeline, trend_ts = _trend_cache
+            elif df_4h is not None:
+                trend_timeline, trend_ts = self._build_4h_trend_timeline(df_4h)
+            else:
+                trend_timeline, trend_ts = {}, []
+
+            if _fg_cache is not None:
+                fg_lookup, fg_dates = _fg_cache
+            elif fg_history is not None:
+                fg_lookup, fg_dates = self._build_fg_lookup(fg_history)
+            else:
+                fg_lookup, fg_dates = {}, []
 
             blocked_trend = 0
             blocked_fg = 0
@@ -213,41 +301,37 @@ class BacktestEngine:
                 is_bullish = signal.signal_type.value in ("BUY", "STRONG_BUY")
                 is_bearish = signal.signal_type.value in ("SELL", "STRONG_SELL")
 
-                # 4H trend gate
-                trend = self._lookup_4h_trend(trend_ts, trend_timeline, signal_time) if trend_ts else 0
-                trend_confirms = (
-                    (is_bullish and trend == +1)
-                    or (is_bearish and trend == -1)
-                    or trend == 0
-                )
-                if not trend_confirms:
-                    blocked_trend += 1
-                    logger.debug(
-                        "Backtest: %s at %s blocked by 4H trend=%+d",
-                        signal.signal_type.value, signal_time, trend,
-                    )
-                    continue
+                apply_4h = opts.gate_mode in ("full", "4h_only") and trend_ts
+                apply_fg = opts.gate_mode in ("full", "fg_only") and fg_dates
 
-                # Fear & Greed macro filter
-                fg_value = self._lookup_fg(fg_dates, fg_lookup, signal_time) if fg_dates else None
-                fg_allows = True
-                if fg_value is not None:
-                    if is_bullish and fg_value >= 40:
-                        fg_allows = False
-                    elif is_bearish and fg_value <= 60:
-                        fg_allows = False
-                if not fg_allows:
-                    blocked_fg += 1
-                    logger.debug(
-                        "Backtest: %s at %s blocked by F&G=%d",
-                        signal.signal_type.value, signal_time, fg_value,
+                if apply_4h:
+                    trend = self._lookup_4h_trend(trend_ts, trend_timeline, signal_time)
+                    trend_confirms = (
+                        (is_bullish and trend == +1)
+                        or (is_bearish and trend == -1)
+                        or trend == 0
                     )
-                    continue
+                    if not trend_confirms:
+                        blocked_trend += 1
+                        continue
+
+                if apply_fg:
+                    fg_value = self._lookup_fg(fg_dates, fg_lookup, signal_time)
+                    fg_allows = True
+                    if fg_value is not None:
+                        if is_bullish and fg_value >= 40:
+                            fg_allows = False
+                        elif is_bearish and fg_value <= 60:
+                            fg_allows = False
+                    if not fg_allows:
+                        blocked_fg += 1
+                        continue
 
                 gated_signals.append((bar_idx, signal))
 
-            gated_trades = self._simulate_trades(df, gated_signals)
+            gated_trades = self._simulate_trades(df, gated_signals, round_trip_fee)
             gated_metrics = self._compute_metrics(gated_trades, len(gated_signals))
+            gated_metrics.taker_fee_pct = opts.taker_fee_pct
 
             result.has_gated_run = True
             result.gated_total_signals = gated_metrics.total_signals
@@ -261,14 +345,9 @@ class BacktestEngine:
             result.gated_max_drawdown_pct = gated_metrics.max_drawdown_pct
             result.gated_sharpe_proxy = gated_metrics.sharpe_proxy
             result.gated_total_return_pct = gated_metrics.total_return_pct
+            result.gated_total_return_pct_gross = gated_metrics.total_return_pct_gross
             result.signals_blocked_by_4h_trend = blocked_trend
             result.signals_blocked_by_fg = blocked_fg
-
-            logger.info(
-                "Gated backtest: %d/%d signals passed gates "
-                "(%d blocked by 4H trend, %d blocked by F&G)",
-                len(gated_signals), len(signals_fired), blocked_trend, blocked_fg,
-            )
 
         return result
 
@@ -283,7 +362,10 @@ class BacktestEngine:
         return df.dropna(subset=list(required)).copy()
 
     def _simulate_trades(
-        self, df: pd.DataFrame, signals: list[tuple[int, SignalResult]]
+        self,
+        df: pd.DataFrame,
+        signals: list[tuple[int, SignalResult]],
+        round_trip_fee_pct: float = 0.0,
     ) -> list[Trade]:
         """
         Simulate trade execution for each signal.
@@ -353,12 +435,14 @@ class BacktestEngine:
                 trade.exit_reason = "TIMEOUT"
                 trade.exit_time = last_row.get("timestamp", last_row.name)
 
-            # Calculate PnL
+            # Calculate PnL (gross then net of round-trip taker fees)
             if trade.exit_price:
                 if is_long:
-                    trade.pnl_pct = (trade.exit_price - trade.entry_price) / trade.entry_price * 100
+                    gross = (trade.exit_price - trade.entry_price) / trade.entry_price * 100
                 else:
-                    trade.pnl_pct = (trade.entry_price - trade.exit_price) / trade.entry_price * 100
+                    gross = (trade.entry_price - trade.exit_price) / trade.entry_price * 100
+                trade.pnl_pct_gross = gross
+                trade.pnl_pct = gross - round_trip_fee_pct
                 trade.is_winner = trade.pnl_pct > 0
 
             trades.append(trade)
@@ -390,6 +474,10 @@ class BacktestEngine:
         result.profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
         result.total_return_pct = float(np.sum(pnls))
+        gross_pnls = [
+            t.pnl_pct_gross for t in completed if t.pnl_pct_gross is not None
+        ]
+        result.total_return_pct_gross = float(np.sum(gross_pnls)) if gross_pnls else result.total_return_pct
 
         # Max drawdown (equity curve based)
         equity = np.cumsum(pnls)

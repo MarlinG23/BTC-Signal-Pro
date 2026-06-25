@@ -63,7 +63,11 @@ class BinanceWebSocketClient:
         self._calculator = calculator
         self._calculator_4h = calculator_4h
         self._candle_callbacks: list[Callable[[Candle, IndicatorSnapshot], Awaitable[None]]] = []
+        self._4h_candle_callbacks: list[
+            Callable[[Candle, IndicatorSnapshot], Awaitable[None]]
+        ] = []
         self._tick_callbacks: list[Callable[[dict], Awaitable[None]]] = []
+        self._last_4h_closed_ts: Optional[pd.Timestamp] = None
         self._running = False
         self._latest_price: Optional[float] = None
         self._latest_price_time: Optional[float] = None
@@ -77,6 +81,12 @@ class BinanceWebSocketClient:
     ) -> None:
         """Register an async callback fired when a 1-minute candle closes."""
         self._candle_callbacks.append(callback)
+
+    def on_4h_candle_closed(
+        self, callback: Callable[[Candle, IndicatorSnapshot], Awaitable[None]]
+    ) -> None:
+        """Register an async callback fired when a 4-hour candle closes."""
+        self._4h_candle_callbacks.append(callback)
 
     def on_price_tick(self, callback: Callable[[dict], Awaitable[None]]) -> None:
         """Register an async callback fired on every bookTicker update."""
@@ -169,6 +179,7 @@ class BinanceWebSocketClient:
         if self._calculator_4h is None:
             return 0
 
+        self._last_4h_closed_ts = None
         import httpx
 
         endpoints = (
@@ -191,6 +202,7 @@ class BinanceWebSocketClient:
                     klines = resp.json()
 
                 count = 0
+                last_closed: Optional[pd.Timestamp] = None
                 for k in klines[:-1]:  # skip the current (still open) 4H candle
                     candle = Candle(
                         timestamp=pd.Timestamp(k[0], unit="ms", tz="UTC"),
@@ -201,7 +213,10 @@ class BinanceWebSocketClient:
                         volume=float(k[7]),  # USDT quote volume
                     )
                     self._calculator_4h.push_candle(candle)
+                    last_closed = candle.timestamp
                     count += 1
+                if last_closed is not None:
+                    self._last_4h_closed_ts = last_closed
 
                 logger.info(
                     "Preloaded %d × 4H candles from %s — trend indicators ready",
@@ -259,6 +274,7 @@ class BinanceWebSocketClient:
             base = WS_BASE_COM      # binance.com — blocked on Railway US West
         streams = [
             f"{SYMBOL}@kline_1m",
+            f"{SYMBOL}@kline_4h",
             f"{SYMBOL}@bookTicker",
             f"{SYMBOL}@aggTrade",
         ]
@@ -295,6 +311,8 @@ class BinanceWebSocketClient:
 
         if "@kline_1m" in stream_name:
             await self._handle_kline(data)
+        elif "@kline_4h" in stream_name:
+            await self._handle_kline_4h(data)
         elif "@bookTicker" in stream_name:
             await self._handle_book_ticker(data)
         elif "@aggTrade" in stream_name:
@@ -339,6 +357,48 @@ class BinanceWebSocketClient:
                 await cb(candle, snapshot)
             except Exception as exc:
                 logger.error("Candle callback error: %s", exc, exc_info=True)
+
+    async def _handle_kline_4h(self, data: dict) -> None:
+        """Push closed 4H candles into the trend calculator in real time."""
+        if self._calculator_4h is None:
+            return
+
+        k = data.get("k", {})
+        if not k.get("x"):
+            return
+
+        try:
+            candle = Candle(
+                timestamp=pd.Timestamp(k["t"], unit="ms", tz="UTC"),
+                open=float(k["o"]),
+                high=float(k["h"]),
+                low=float(k["l"]),
+                close=float(k["c"]),
+                volume=float(k["q"]),
+            )
+        except (KeyError, ValueError) as exc:
+            logger.error("Malformed 4H kline payload: %s — %s", k, exc)
+            return
+
+        if (
+            self._last_4h_closed_ts is not None
+            and candle.timestamp <= self._last_4h_closed_ts
+        ):
+            return
+
+        self._last_4h_closed_ts = candle.timestamp
+        snapshot = self._calculator_4h.push_candle(candle)
+        logger.info(
+            "4H candle closed via WebSocket: close=%.2f rsi=%.1f",
+            candle.close,
+            snapshot.rsi_14 if snapshot.rsi_14 else 0,
+        )
+
+        for cb in self._4h_candle_callbacks:
+            try:
+                await cb(candle, snapshot)
+            except Exception as exc:
+                logger.error("4H candle callback error: %s", exc, exc_info=True)
 
     async def _handle_book_ticker(self, data: dict) -> None:
         """Update the latest best-bid/ask price from bookTicker events."""

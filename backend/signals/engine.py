@@ -106,10 +106,27 @@ class SignalEngine:
         SignalType.HOLD: 1.0,
     }
 
-    def __init__(self) -> None:
-        self._threshold = settings.SIGNAL_CONFIDENCE_THRESHOLD
-        self._min_indicators = settings.SIGNAL_MIN_INDICATORS
+    def __init__(
+        self,
+        *,
+        confidence_threshold: Optional[float] = None,
+        min_indicators: Optional[int] = None,
+        min_tp_pct: float = 0.005,
+        min_sl_pct: float = 0.003,
+    ) -> None:
+        self._threshold = (
+            confidence_threshold
+            if confidence_threshold is not None
+            else settings.SIGNAL_CONFIDENCE_THRESHOLD
+        )
+        self._min_indicators = (
+            min_indicators
+            if min_indicators is not None
+            else settings.SIGNAL_MIN_INDICATORS
+        )
         self._min_candles = settings.SIGNAL_MIN_CANDLES
+        self._min_tp_pct = min_tp_pct
+        self._min_sl_pct = min_sl_pct
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -404,8 +421,8 @@ class SignalEngine:
         TP distance = max(ATR × 2, 0.5% of entry)
         SL distance = max(ATR × 1, 0.3% of entry)
         """
-        min_tp_dist = entry * 0.005  # 0.5%
-        min_sl_dist = entry * 0.003  # 0.3%
+        min_tp_dist = entry * self._min_tp_pct
+        min_sl_dist = entry * self._min_sl_pct
 
         if atr_14 is not None and atr_14 > 0:
             tp_from_atr = atr_14 * 2
