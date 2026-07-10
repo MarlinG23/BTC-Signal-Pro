@@ -113,6 +113,7 @@ class SignalEngine:
         min_indicators: Optional[int] = None,
         min_tp_pct: float = 0.005,
         min_sl_pct: float = 0.003,
+        min_atr_pct: Optional[float] = None,
     ) -> None:
         self._threshold = (
             confidence_threshold
@@ -127,6 +128,10 @@ class SignalEngine:
         self._min_candles = settings.SIGNAL_MIN_CANDLES
         self._min_tp_pct = min_tp_pct
         self._min_sl_pct = min_sl_pct
+        # Research-only regime filter: skip evaluation entirely when the
+        # market is too quiet (ATR/price below this ratio) to be worth
+        # trading — does not affect the live engine unless explicitly set.
+        self._min_atr_pct = min_atr_pct
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -146,6 +151,12 @@ class SignalEngine:
             return None
         if candle_count < self._min_candles:
             return None
+        if self._min_atr_pct is not None:
+            if snapshot.atr_14 is None:
+                return None
+            atr_pct = snapshot.atr_14 / snapshot.close_price
+            if atr_pct < self._min_atr_pct:
+                return None  # regime too quiet/choppy — not worth trading
 
         try:
             votes = self._cast_votes(snapshot)

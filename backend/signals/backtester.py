@@ -57,6 +57,11 @@ class BacktestOptions:
     min_tp_pct: float = 0.005  # 0.5% minimum TP distance
     min_sl_pct: float = 0.003  # 0.3% minimum SL distance
     sequential_only: bool = False  # only one open position at a time (skip signals while a prior trade is still open)
+    min_atr_pct: Optional[float] = None  # regime filter: skip signals when ATR/price is below this (chop filter)
+    use_trailing_exit: bool = False  # "let winners run" — trail stop instead of fixed TP once in profit
+    trailing_activation_pct: float = 0.004  # favorable move required before trailing starts
+    trailing_distance_pct: float = 0.003  # trail distance behind the high/low-water mark once active
+    trailing_max_hold_bars: int = 180  # wider hold window than the default fixed-TP simulation
 
 
 @dataclass
@@ -242,6 +247,7 @@ class BacktestEngine:
             min_indicators=opts.min_indicators,
             min_tp_pct=opts.min_tp_pct,
             min_sl_pct=opts.min_sl_pct,
+            min_atr_pct=opts.min_atr_pct,
         )
         signals_fired: list[tuple[int, SignalResult]] = []
         for i, (timestamp, row) in enumerate(df.iterrows()):
@@ -275,7 +281,11 @@ class BacktestEngine:
         round_trip_fee = opts.taker_fee_pct * 2
 
         trades, skipped = self._simulate_trades(
-            df, signals_fired, round_trip_fee, sequential=opts.sequential_only
+            df,
+            signals_fired,
+            round_trip_fee,
+            sequential=opts.sequential_only,
+            options=opts,
         )
         result = self._compute_metrics(trades, len(signals_fired))
         result.taker_fee_pct = opts.taker_fee_pct
@@ -338,7 +348,11 @@ class BacktestEngine:
                 gated_signals.append((bar_idx, signal))
 
             gated_trades, gated_skipped = self._simulate_trades(
-                df, gated_signals, round_trip_fee, sequential=opts.sequential_only
+                df,
+                gated_signals,
+                round_trip_fee,
+                sequential=opts.sequential_only,
+                options=opts,
             )
             gated_metrics = self._compute_metrics(gated_trades, len(gated_signals))
             gated_metrics.taker_fee_pct = opts.taker_fee_pct
@@ -379,6 +393,7 @@ class BacktestEngine:
         round_trip_fee_pct: float = 0.0,
         *,
         sequential: bool = False,
+        options: Optional[BacktestOptions] = None,
     ) -> tuple[list[Trade], int]:
         """
         Simulate trade execution for each signal.
@@ -392,8 +407,13 @@ class BacktestEngine:
         as ``skipped`` so the opportunity cost is visible). Signals are
         processed in bar order regardless of the input order.
 
+        When ``options.use_trailing_exit`` is True, the fixed take-profit is
+        replaced with a trailing stop that only activates after a favorable
+        move — a "let winners run" exit instead of a hard TP cap.
+
         Returns ``(trades, skipped_count)``.
         """
+        opts = options or BacktestOptions()
         rows = df.reset_index()
         trades: list[Trade] = []
         skipped = 0
@@ -421,53 +441,18 @@ class BacktestEngine:
 
             is_long = signal.signal_type in (SignalType.STRONG_BUY, SignalType.BUY)
 
-            # Scan forward bars
-            end_idx = min(bar_idx + 1 + self._max_hold_bars, len(rows))
-            exited = False
-            exit_bar_idx = end_idx - 1
+            if opts.use_trailing_exit:
+                exit_price, exit_reason, exit_time, exit_bar_idx = self._scan_trailing_exit(
+                    rows, bar_idx, signal, is_long, opts
+                )
+            else:
+                exit_price, exit_reason, exit_time, exit_bar_idx = self._scan_fixed_exit(
+                    rows, bar_idx, signal, is_long
+                )
 
-            for fwd_idx in range(bar_idx + 1, end_idx):
-                fwd_row = rows.iloc[fwd_idx]
-                high, low = float(fwd_row["high"]), float(fwd_row["low"])
-
-                if is_long:
-                    # Check stop-loss first (worst case)
-                    if signal.stop_loss and low <= signal.stop_loss:
-                        trade.exit_price = signal.stop_loss
-                        trade.exit_reason = "SL_HIT"
-                        trade.exit_time = fwd_row.get("timestamp", fwd_row.name)
-                        exited = True
-                        exit_bar_idx = fwd_idx
-                        break
-                    if signal.take_profit and high >= signal.take_profit:
-                        trade.exit_price = signal.take_profit
-                        trade.exit_reason = "TP_HIT"
-                        trade.exit_time = fwd_row.get("timestamp", fwd_row.name)
-                        exited = True
-                        exit_bar_idx = fwd_idx
-                        break
-                else:
-                    # Short trade
-                    if signal.stop_loss and high >= signal.stop_loss:
-                        trade.exit_price = signal.stop_loss
-                        trade.exit_reason = "SL_HIT"
-                        trade.exit_time = fwd_row.get("timestamp", fwd_row.name)
-                        exited = True
-                        exit_bar_idx = fwd_idx
-                        break
-                    if signal.take_profit and low <= signal.take_profit:
-                        trade.exit_price = signal.take_profit
-                        trade.exit_reason = "TP_HIT"
-                        trade.exit_time = fwd_row.get("timestamp", fwd_row.name)
-                        exited = True
-                        exit_bar_idx = fwd_idx
-                        break
-
-            if not exited:
-                last_row = rows.iloc[end_idx - 1]
-                trade.exit_price = float(last_row["close"])
-                trade.exit_reason = "TIMEOUT"
-                trade.exit_time = last_row.get("timestamp", last_row.name)
+            trade.exit_price = exit_price
+            trade.exit_reason = exit_reason
+            trade.exit_time = exit_time
 
             # Calculate PnL (gross then net of round-trip taker fees)
             if trade.exit_price:
@@ -485,6 +470,95 @@ class BacktestEngine:
                 next_available_idx = exit_bar_idx + 1
 
         return trades, skipped
+
+    def _scan_fixed_exit(
+        self,
+        rows: pd.DataFrame,
+        bar_idx: int,
+        signal: SignalResult,
+        is_long: bool,
+    ) -> tuple[Optional[float], str, object, int]:
+        """Original fixed TP/SL exit scan. Returns (price, reason, time, exit_bar_idx)."""
+        end_idx = min(bar_idx + 1 + self._max_hold_bars, len(rows))
+
+        for fwd_idx in range(bar_idx + 1, end_idx):
+            fwd_row = rows.iloc[fwd_idx]
+            high, low = float(fwd_row["high"]), float(fwd_row["low"])
+            ts = fwd_row.get("timestamp", fwd_row.name)
+
+            if is_long:
+                if signal.stop_loss and low <= signal.stop_loss:
+                    return signal.stop_loss, "SL_HIT", ts, fwd_idx
+                if signal.take_profit and high >= signal.take_profit:
+                    return signal.take_profit, "TP_HIT", ts, fwd_idx
+            else:
+                if signal.stop_loss and high >= signal.stop_loss:
+                    return signal.stop_loss, "SL_HIT", ts, fwd_idx
+                if signal.take_profit and low <= signal.take_profit:
+                    return signal.take_profit, "TP_HIT", ts, fwd_idx
+
+        last_row = rows.iloc[end_idx - 1]
+        return (
+            float(last_row["close"]),
+            "TIMEOUT",
+            last_row.get("timestamp", last_row.name),
+            end_idx - 1,
+        )
+
+    def _scan_trailing_exit(
+        self,
+        rows: pd.DataFrame,
+        bar_idx: int,
+        signal: SignalResult,
+        is_long: bool,
+        opts: BacktestOptions,
+    ) -> tuple[Optional[float], str, object, int]:
+        """
+        "Let winners run" exit: hard stop-loss protects until the trade moves
+        favorably by ``trailing_activation_pct``, then a trailing stop
+        (``trailing_distance_pct`` behind the high/low-water mark) takes over
+        instead of a fixed take-profit cap.
+        """
+        end_idx = min(bar_idx + 1 + opts.trailing_max_hold_bars, len(rows))
+        entry_price = signal.entry_price
+        watermark = entry_price
+        trailing_active = False
+
+        for fwd_idx in range(bar_idx + 1, end_idx):
+            fwd_row = rows.iloc[fwd_idx]
+            high, low = float(fwd_row["high"]), float(fwd_row["low"])
+            ts = fwd_row.get("timestamp", fwd_row.name)
+
+            if is_long:
+                watermark = max(watermark, high)
+                favorable_move = (watermark - entry_price) / entry_price
+                if not trailing_active and favorable_move >= opts.trailing_activation_pct:
+                    trailing_active = True
+                if trailing_active:
+                    trail_stop = watermark * (1 - opts.trailing_distance_pct)
+                    if low <= trail_stop:
+                        return trail_stop, "TRAIL_STOP", ts, fwd_idx
+                elif signal.stop_loss and low <= signal.stop_loss:
+                    return signal.stop_loss, "SL_HIT", ts, fwd_idx
+            else:
+                watermark = min(watermark, low)
+                favorable_move = (entry_price - watermark) / entry_price
+                if not trailing_active and favorable_move >= opts.trailing_activation_pct:
+                    trailing_active = True
+                if trailing_active:
+                    trail_stop = watermark * (1 + opts.trailing_distance_pct)
+                    if high >= trail_stop:
+                        return trail_stop, "TRAIL_STOP", ts, fwd_idx
+                elif signal.stop_loss and high >= signal.stop_loss:
+                    return signal.stop_loss, "SL_HIT", ts, fwd_idx
+
+        last_row = rows.iloc[end_idx - 1]
+        return (
+            float(last_row["close"]),
+            "TIMEOUT",
+            last_row.get("timestamp", last_row.name),
+            end_idx - 1,
+        )
 
     def _compute_metrics(self, trades: list[Trade], total_signals: int) -> BacktestResult:
         """Aggregate trade results into performance statistics."""

@@ -71,6 +71,13 @@ _sweep_result: Optional[dict] = None
 _sweep_error: Optional[str] = None
 _sweep_running = False
 
+# Research single-backtest job state — separate from the sweep job so a
+# long single backtest (e.g. 60-90 day windows) doesn't collide with sweeps.
+_backtest_job_task: Optional[asyncio.Task] = None
+_backtest_job_result: Optional[dict] = None
+_backtest_job_error: Optional[str] = None
+_backtest_job_running = False
+
 # Startup / status tracking
 _startup_ready = False
 _app_start_time = time.time()
@@ -592,6 +599,35 @@ async def admin_param_sweep_status():
     return {"status": "idle"}
 
 
+async def _run_backtest_core(days: int, db: AsyncSession, options: BacktestOptions, gate_mode: str) -> dict:
+    frames = await _load_backtest_frames(days, db)
+    df = frames["df"]
+    df_4h = frames["df_4h"]
+    fg_history = frames["fg_history"]
+
+    loop = asyncio.get_running_loop()
+    backtest_result = await loop.run_in_executor(
+        None,
+        lambda: BacktestEngine().run(
+            df, df_4h=df_4h, fg_history=fg_history, options=options
+        ),
+    )
+    return {
+        **backtest_result.to_dict(),
+        "candles_used": len(df),
+        "4h_candles_used": len(df_4h) if df_4h is not None else 0,
+        "fg_days_used": len(fg_history) if fg_history else 0,
+        "gate_mode": gate_mode,
+        "confidence_threshold": options.confidence_threshold,
+        "min_indicators": options.min_indicators,
+        "min_tp_pct": options.min_tp_pct,
+        "min_sl_pct": options.min_sl_pct,
+        "sequential_only": options.sequential_only,
+        "min_atr_pct": options.min_atr_pct,
+        "use_trailing_exit": options.use_trailing_exit,
+    }
+
+
 @app.get("/api/backtest")
 async def run_backtest(
     days: int = 30,
@@ -602,6 +638,12 @@ async def run_backtest(
     min_tp_pct: float = 0.005,
     min_sl_pct: float = 0.003,
     sequential_only: bool = False,
+    min_atr_pct: Optional[float] = None,
+    use_trailing_exit: bool = False,
+    trailing_activation_pct: float = 0.004,
+    trailing_distance_pct: float = 0.003,
+    trailing_max_hold_bars: int = 180,
+    async_run: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -612,52 +654,79 @@ async def run_backtest(
     sequential_only=true enforces one open position at a time (skips any
     signal that fires while a prior trade hasn't hit TP/SL/timeout yet) —
     research-only opportunity-cost analysis of overtrading vs fees.
+
+    min_atr_pct sets a volatility regime filter (skip signals when
+    ATR/price is below this ratio — avoids trading dead-flat chop).
+
+    use_trailing_exit replaces the fixed take-profit with a trailing stop
+    that only activates after a favorable move ("let winners run").
+
+    async_run=true (recommended for windows beyond ~30-45 days, which can
+    exceed Railway's ~5min proxy timeout) returns immediately; poll
+    GET /api/admin/backtest/status for the result.
     """
+    global _backtest_job_task, _backtest_job_running, _backtest_job_result, _backtest_job_error
+
     if days < 1 or days > 180:
         raise HTTPException(status_code=400, detail="days must be between 1 and 180.")
     if gate_mode not in ("full", "4h_only", "fg_only", "none"):
         raise HTTPException(status_code=400, detail="Invalid gate_mode.")
 
+    options = BacktestOptions(
+        taker_fee_pct=taker_fee_pct,
+        gate_mode=gate_mode,  # type: ignore[arg-type]
+        confidence_threshold=confidence_threshold,
+        min_indicators=min_indicators,
+        min_tp_pct=min_tp_pct,
+        min_sl_pct=min_sl_pct,
+        sequential_only=sequential_only,
+        min_atr_pct=min_atr_pct,
+        use_trailing_exit=use_trailing_exit,
+        trailing_activation_pct=trailing_activation_pct,
+        trailing_distance_pct=trailing_distance_pct,
+        trailing_max_hold_bars=trailing_max_hold_bars,
+    )
+
+    if async_run:
+        if _backtest_job_running:
+            return {"status": "running", "poll": "/api/admin/backtest/status"}
+        _backtest_job_result = None
+        _backtest_job_error = None
+        _backtest_job_running = True
+
+        async def _job() -> None:
+            global _backtest_job_result, _backtest_job_error, _backtest_job_running
+            try:
+                async with AsyncSessionLocal() as session:
+                    _backtest_job_result = await _run_backtest_core(days, session, options, gate_mode)
+            except Exception as exc:
+                logger.error("Background backtest failed: %s", exc, exc_info=True)
+                _backtest_job_error = str(exc)
+            finally:
+                _backtest_job_running = False
+
+        _backtest_job_task = asyncio.create_task(_job(), name="backtest")
+        return {"status": "started", "poll": "/api/admin/backtest/status"}
+
     try:
-        frames = await _load_backtest_frames(days, db)
-        df = frames["df"]
-        df_4h = frames["df_4h"]
-        fg_history = frames["fg_history"]
-
-        options = BacktestOptions(
-            taker_fee_pct=taker_fee_pct,
-            gate_mode=gate_mode,  # type: ignore[arg-type]
-            confidence_threshold=confidence_threshold,
-            min_indicators=min_indicators,
-            min_tp_pct=min_tp_pct,
-            min_sl_pct=min_sl_pct,
-            sequential_only=sequential_only,
-        )
-        loop = asyncio.get_running_loop()
-        backtest_result = await loop.run_in_executor(
-            None,
-            lambda: BacktestEngine().run(
-                df, df_4h=df_4h, fg_history=fg_history, options=options
-            ),
-        )
-        return {
-            **backtest_result.to_dict(),
-            "candles_used": len(df),
-            "4h_candles_used": len(df_4h) if df_4h is not None else 0,
-            "fg_days_used": len(fg_history) if fg_history else 0,
-            "gate_mode": gate_mode,
-            "confidence_threshold": confidence_threshold,
-            "min_indicators": min_indicators,
-            "min_tp_pct": min_tp_pct,
-            "min_sl_pct": min_sl_pct,
-            "sequential_only": sequential_only,
-        }
-
+        return await _run_backtest_core(days, db, options, gate_mode)
     except HTTPException:
         raise
     except Exception as exc:
         logger.error("Backtest failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Backtest failed.")
+
+
+@app.get("/api/admin/backtest/status")
+async def admin_backtest_status():
+    """Poll background single-backtest job status and result."""
+    if _backtest_job_running:
+        return {"status": "running"}
+    if _backtest_job_error:
+        return {"status": "error", "error": _backtest_job_error}
+    if _backtest_job_result:
+        return {"status": "complete", "result": _backtest_job_result}
+    return {"status": "idle"}
 
 
 @app.get("/api/backtest/deadzone")

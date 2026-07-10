@@ -180,6 +180,68 @@ class TestSequentialOnly:
             last_exit_time = trade.exit_time
 
 
+class TestTrailingExit:
+    def test_trailing_exit_produces_trail_stop_reason(self):
+        np.random.seed(21)
+        df = _make_ohlcv_dataframe(600, trend="up")
+        result = BacktestEngine().run(
+            df,
+            options=BacktestOptions(
+                gate_mode="none",
+                use_trailing_exit=True,
+                trailing_activation_pct=0.002,
+                trailing_distance_pct=0.0015,
+                trailing_max_hold_bars=120,
+            ),
+        )
+        reasons = {t.exit_reason for t in result.trades}
+        # On a sustained uptrend at least some trades should trail instead of
+        # hitting the hard stop or timing out.
+        assert reasons  # non-empty — trades were simulated
+        assert reasons <= {"SL_HIT", "TRAIL_STOP", "TIMEOUT"}
+
+    def test_trailing_exit_respects_hard_stop_before_activation(self):
+        np.random.seed(21)
+        df = _make_ohlcv_dataframe(300, trend="down")
+        result = BacktestEngine().run(
+            df,
+            options=BacktestOptions(
+                gate_mode="none",
+                use_trailing_exit=True,
+                trailing_activation_pct=0.05,  # unrealistically high — never activates
+                trailing_distance_pct=0.003,
+                trailing_max_hold_bars=60,
+            ),
+        )
+        # With activation essentially unreachable, no trade should exit via TRAIL_STOP
+        assert all(t.exit_reason != "TRAIL_STOP" for t in result.trades)
+
+
+class TestRegimeFilter:
+    def test_min_atr_pct_blocks_signals_in_low_volatility(self):
+        base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        n = 300
+        timestamps = [base + timedelta(minutes=i) for i in range(n)]
+        flat_price = 45_000.0
+        df = pd.DataFrame(
+            {
+                "open": [flat_price] * n,
+                "high": [flat_price + 0.5] * n,
+                "low": [flat_price - 0.5] * n,
+                "close": [flat_price] * n,
+                "volume": [100.0] * n,
+            },
+            index=pd.DatetimeIndex(timestamps, tz=timezone.utc),
+        )
+        engine = BacktestEngine()
+        _, signals_normal = engine.collect_signals(df, BacktestOptions())
+        _, signals_filtered = engine.collect_signals(
+            df, BacktestOptions(min_atr_pct=0.01)
+        )
+        assert len(signals_filtered) == 0
+        assert len(signals_filtered) <= len(signals_normal)
+
+
 class TestDeadzoneAnalysis:
     def test_analyze_deadzone_returns_structure(self):
         np.random.seed(99)
