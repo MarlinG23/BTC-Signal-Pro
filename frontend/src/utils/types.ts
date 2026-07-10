@@ -35,7 +35,7 @@ export interface IndicatorSnapshot {
 }
 
 export interface Signal {
-  id: number;
+  id?: number;
   signal_type: SignalType;
   confidence: number;
   entry_price: number;
@@ -44,8 +44,24 @@ export interface Signal {
   risk_reward_ratio: number | null;
   indicators_agreed: number;
   generated_at: string;
-  outcome: "WIN" | "LOSS" | "OPEN" | null;
-  pnl_percent: number | null;
+  outcome?: "WIN" | "LOSS" | "OPEN" | null;
+  pnl_percent?: number | null;
+}
+
+/** Blocked 1M entry broadcast over WebSocket — not persisted to DB. */
+export interface WaitSignal {
+  signal_type: SignalType;
+  confidence: number;
+  entry_price: number;
+  take_profit: number | null;
+  stop_loss: number | null;
+  risk_reward_ratio: number | null;
+  indicators_agreed: number;
+  generated_at: string;
+  display_state: "WAIT";
+  block_reason: string;
+  trend_4h?: number;
+  fear_greed?: number | null;
 }
 
 export interface NewsItem {
@@ -122,6 +138,7 @@ export interface WsMessage {
     | "price_tick"
     | "indicators"
     | "signal"
+    | "signal_wait"
     | "alert"
     | "news"
     | "fear_greed"

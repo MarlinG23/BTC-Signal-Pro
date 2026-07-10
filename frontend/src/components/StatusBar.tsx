@@ -5,6 +5,8 @@
 import clsx from "clsx";
 import { useApi } from "../hooks/useApi";
 import { SystemStatus } from "../utils/types";
+import { isAudioUnlocked, playSignalBeep, unlockAudio } from "../utils/audio";
+import { useState } from "react";
 
 function Pill({
   label,
@@ -46,6 +48,13 @@ function formatUptime(seconds: number): string {
 
 export function StatusBar() {
   const { data: status, loading } = useApi<SystemStatus>("/api/status", 30_000);
+  const [audioReady, setAudioReady] = useState(isAudioUnlocked());
+
+  async function handleTestBeep() {
+    await unlockAudio();
+    setAudioReady(isAudioUnlocked());
+    playSignalBeep(true);
+  }
 
   if (loading && !status) {
     return (
@@ -112,6 +121,23 @@ export function StatusBar() {
           ok={status.startup_ready}
           detail={formatUptime(status.uptime_seconds)}
         />
+        <button
+          type="button"
+          onClick={handleTestBeep}
+          className={clsx(
+            "rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors",
+            audioReady
+              ? "border-brand-blue/40 bg-brand-blue/10 text-brand-blue hover:bg-brand-blue/20"
+              : "border-yellow-500/40 bg-yellow-500/10 text-yellow-300 hover:bg-yellow-500/20"
+          )}
+          title={
+            audioReady
+              ? "Play test beep"
+              : "Click anywhere on the page first, then test beep"
+          }
+        >
+          {audioReady ? "🔔 Test beep" : "🔇 Enable sound"}
+        </button>
       </div>
     </div>
   );

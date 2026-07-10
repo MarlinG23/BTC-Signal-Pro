@@ -10,7 +10,7 @@
  *   REST API  → initial signal history, news history, alert history (polled every 30s)
  */
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useApi } from "../hooks/useApi";
 import {
@@ -19,6 +19,7 @@ import {
   IndicatorSnapshot,
   NewsItem,
   Signal,
+  WaitSignal,
   WsMessage,
 } from "../utils/types";
 
@@ -34,31 +35,14 @@ import { BacktestPanel } from "../components/BacktestPanel";
 import { StatusBar } from "../components/StatusBar";
 import { isSignalFresh } from "../utils/signalFreshness";
 import { deriveTrend } from "../utils/trend";
-
-// Sound alert using Web Audio API — plays a short beep on new signal
-function playSignalSound(type: string) {
-  try {
-    const ctx = new AudioContext();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.frequency.value =
-      type === "STRONG_BUY" || type === "BUY" ? 880 : 440;
-    gain.gain.setValueAtTime(0.3, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 0.5);
-  } catch {
-    // AudioContext may be blocked by browser policy — silently ignore
-  }
-}
+import { playSignalBeep, unlockAudio } from "../utils/audio";
 
 export function Dashboard() {
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [candleCount, setCandleCount] = useState(0);
   const [indicators, setIndicators] = useState<IndicatorSnapshot | null>(null);
   const [latestSignal, setLatestSignal] = useState<Signal | null>(null);
+  const [latestWait, setLatestWait] = useState<WaitSignal | null>(null);
   const [fearGreed, setFearGreed] = useState<FearGreedData | null>(null);
   const [liveAlerts, setLiveAlerts] = useState<AlertItem[]>([]);
   const [liveNews, setLiveNews] = useState<NewsItem[]>([]);
@@ -111,8 +95,10 @@ export function Dashboard() {
       case "signal": {
         const sig = msg as unknown as Signal & { type: string };
         setLatestSignal(sig);
-        playSignalSound(sig.signal_type as string);
-        // Add to live alerts list
+        setLatestWait(null);
+        const bullish =
+          sig.signal_type === "BUY" || sig.signal_type === "STRONG_BUY";
+        playSignalBeep(bullish);
         setLiveAlerts((prev) => [
           {
             id: nextAlertId.current--,
@@ -123,6 +109,25 @@ export function Dashboard() {
           },
           ...prev.slice(0, 49),
         ]);
+        break;
+      }
+
+      case "signal_wait": {
+        const wait = msg as unknown as WaitSignal & { type: string };
+        setLatestWait({
+          signal_type: wait.signal_type,
+          confidence: wait.confidence,
+          entry_price: wait.entry_price,
+          take_profit: wait.take_profit,
+          stop_loss: wait.stop_loss,
+          risk_reward_ratio: wait.risk_reward_ratio,
+          indicators_agreed: wait.indicators_agreed,
+          generated_at: wait.generated_at,
+          display_state: "WAIT",
+          block_reason: wait.block_reason as string,
+          trend_4h: wait.trend_4h as number | undefined,
+          fear_greed: wait.fear_greed as number | null | undefined,
+        });
         break;
       }
 
@@ -172,6 +177,18 @@ export function Dashboard() {
 
   const { connected } = useWebSocket({ onMessage: handleWsMessage });
 
+  useEffect(() => {
+    const unlock = () => {
+      void unlockAudio();
+    };
+    document.addEventListener("click", unlock, { once: true });
+    document.addEventListener("touchstart", unlock, { once: true });
+    return () => {
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
+    };
+  }, []);
+
   // Merge live alerts with historical
   const allAlerts: AlertItem[] = [
     ...liveAlerts,
@@ -196,6 +213,11 @@ export function Dashboard() {
       ? candidateSignal
       : null;
 
+  const displayWait =
+    latestWait && isSignalFresh(latestWait.generated_at) && !displaySignal
+      ? latestWait
+      : null;
+
   return (
     <div className="min-h-screen bg-brand-dark">
       <div className="max-w-7xl mx-auto px-4 py-6">
@@ -215,6 +237,7 @@ export function Dashboard() {
             {/* Signal Badge — most prominent element */}
             <SignalBadge
               signal={displaySignal}
+              waitSignal={displayWait}
               trend4h={trend4h}
               currentPrice={livePrice}
               atr14={indicators?.atr_14 ?? null}

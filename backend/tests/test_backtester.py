@@ -149,3 +149,66 @@ class TestBacktestTrades:
             assert with_fee.total_return_pct_gross == pytest.approx(
                 no_fee.total_return_pct, rel=1e-6
             )
+
+
+class TestSequentialOnly:
+    def test_sequential_reduces_or_equals_trade_count(self):
+        np.random.seed(11)
+        df = _make_ohlcv_dataframe(500, trend="flat")
+        normal = BacktestEngine().run(df, options=BacktestOptions(gate_mode="none"))
+        sequential = BacktestEngine().run(
+            df, options=BacktestOptions(gate_mode="none", sequential_only=True)
+        )
+        assert sequential.total_trades <= normal.total_trades
+        assert sequential.skipped_while_in_position >= 0
+        # Every trade taken plus every trade skipped should account for all fired signals
+        # that had forward bars available to simulate.
+        assert sequential.total_trades + sequential.skipped_while_in_position <= sequential.total_signals
+
+    def test_sequential_trades_do_not_overlap(self):
+        np.random.seed(11)
+        df = _make_ohlcv_dataframe(500, trend="flat")
+        engine = BacktestEngine()
+        _, signals = engine.collect_signals(df)
+        trades, _skipped = engine._simulate_trades(df, signals, sequential=True)
+
+        rows = df.reset_index()
+        last_exit_time = None
+        for trade in trades:
+            if last_exit_time is not None:
+                assert trade.entry_time >= last_exit_time
+            last_exit_time = trade.exit_time
+
+
+class TestDeadzoneAnalysis:
+    def test_analyze_deadzone_returns_structure(self):
+        np.random.seed(99)
+        engine = BacktestEngine()
+        df = _make_ohlcv_dataframe(400, trend="down")
+        df_4h = df.resample("4h").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna()
+        fg_history = [
+            {
+                "timestamp": df.index[0].isoformat(),
+                "value": 15,
+                "classification": "Extreme Fear",
+            }
+        ]
+        for i in range(1, 35):
+            fg_history.append(
+                {
+                    "timestamp": (df.index[0] + timedelta(days=i)).isoformat(),
+                    "value": 15 + (i % 5),
+                    "classification": "Extreme Fear",
+                }
+            )
+
+        _, signals = engine.collect_signals(df)
+        report = engine.analyze_deadzone_opportunity(
+            df, signals, df_4h, fg_history, options=BacktestOptions()
+        )
+        assert "signals_in_deadzone_regime" in report
+        assert "ungated_in_deadzone" in report
+        assert "bearish_fear" in report["by_regime"]
+        assert report["total_1m_signals_in_period"] == len(signals)

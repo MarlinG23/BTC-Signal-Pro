@@ -601,12 +601,17 @@ async def run_backtest(
     min_indicators: int = 3,
     min_tp_pct: float = 0.005,
     min_sl_pct: float = 0.003,
+    sequential_only: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
     """
     Run a backtest over the last N days of stored candles.
 
     Returns 1M-only and gated metrics. Research params do not affect live engine.
+
+    sequential_only=true enforces one open position at a time (skips any
+    signal that fires while a prior trade hasn't hit TP/SL/timeout yet) —
+    research-only opportunity-cost analysis of overtrading vs fees.
     """
     if days < 1 or days > 180:
         raise HTTPException(status_code=400, detail="days must be between 1 and 180.")
@@ -626,6 +631,7 @@ async def run_backtest(
             min_indicators=min_indicators,
             min_tp_pct=min_tp_pct,
             min_sl_pct=min_sl_pct,
+            sequential_only=sequential_only,
         )
         loop = asyncio.get_running_loop()
         backtest_result = await loop.run_in_executor(
@@ -644,6 +650,7 @@ async def run_backtest(
             "min_indicators": min_indicators,
             "min_tp_pct": min_tp_pct,
             "min_sl_pct": min_sl_pct,
+            "sequential_only": sequential_only,
         }
 
     except HTTPException:
@@ -651,6 +658,51 @@ async def run_backtest(
     except Exception as exc:
         logger.error("Backtest failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Backtest failed.")
+
+
+@app.get("/api/backtest/deadzone")
+async def run_deadzone_analysis(
+    days: int = 30,
+    taker_fee_pct: float = 0.04,
+    db: AsyncSession = Depends(get_db),
+):
+    """Research: count 1M signals during gate-deadlock regimes and ungated win rate."""
+    if days < 1 or days > 180:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 180.")
+
+    try:
+        frames = await _load_backtest_frames(days, db)
+        df = frames["df"]
+        df_4h = frames["df_4h"]
+        fg_history = frames["fg_history"]
+
+        if df_4h is None or df_4h.empty:
+            raise HTTPException(status_code=503, detail="4H candle data unavailable.")
+        if not fg_history:
+            raise HTTPException(status_code=503, detail="Fear & Greed history unavailable.")
+
+        options = BacktestOptions(taker_fee_pct=taker_fee_pct)
+        loop = asyncio.get_running_loop()
+        engine = BacktestEngine()
+
+        def _analyze() -> dict:
+            _, signals = engine.collect_signals(df, options)
+            report = engine.analyze_deadzone_opportunity(
+                df, signals, df_4h, fg_history, options=options
+            )
+            report["days"] = days
+            report["candles_used"] = len(df)
+            report["4h_candles_used"] = len(df_4h)
+            report["fg_days_used"] = len(fg_history)
+            return report
+
+        return await loop.run_in_executor(None, _analyze)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Dead-zone analysis failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Dead-zone analysis failed.")
 
 
 async def _load_backtest_frames(days: int, db: AsyncSession) -> dict:
@@ -816,6 +868,37 @@ def _get_4h_trend_direction() -> int:
     return 0
 
 
+def _trend_label(trend: int) -> str:
+    """Human-readable 4H trend for WAIT broadcasts."""
+    if trend == +1:
+        return "BULLISH"
+    if trend == -1:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _build_gate_block_reason(
+    signal_type: str,
+    *,
+    signal_is_bullish: bool,
+    signal_is_bearish: bool,
+    trend: int,
+    fg_value: Optional[int],
+    trend_confirms: bool,
+    fg_allows: bool,
+) -> str:
+    """Explain why a 1M signal was blocked (visibility only — gates unchanged)."""
+    parts: list[str] = []
+    if not trend_confirms:
+        parts.append(f"1M={signal_type} but 4H={_trend_label(trend)}")
+    if not fg_allows and fg_value is not None:
+        if signal_is_bullish:
+            parts.append(f"1M={signal_type} but F&G={fg_value} too high for BUY")
+        elif signal_is_bearish:
+            parts.append(f"1M={signal_type} but F&G={fg_value} too low for SELL")
+    return "; ".join(parts) if parts else "Gate blocked"
+
+
 async def _on_4h_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None:
     """Trend timeframe updated live — no waiting for REST poll."""
     global _4h_last_refreshed
@@ -897,10 +980,29 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
                 "Signal fired: %s conf=%.1f%% 4H_trend=%+d F&G=%s",
                 signal.signal_type.value, signal.confidence, trend, fg_value,
             )
-        elif not trend_confirms:
+        else:
+            block_reason = _build_gate_block_reason(
+                signal.signal_type.value,
+                signal_is_bullish=signal_is_bullish,
+                signal_is_bearish=signal_is_bearish,
+                trend=trend,
+                fg_value=fg_value,
+                trend_confirms=trend_confirms,
+                fg_allows=fg_allows,
+            )
+            wait_dict = {
+                **signal.to_dict(),
+                "type": "signal_wait",
+                "display_state": "WAIT",
+                "trend_4h": trend,
+                "fear_greed": fg_value,
+                "block_reason": block_reason,
+            }
+            await alert_manager.ws_broadcaster.broadcast(wait_dict)
             logger.info(
-                "1M signal %s blocked: 4H trend=%+d disagrees",
-                signal.signal_type.value, trend,
+                "1M signal %s WAIT (not persisted): %s",
+                signal.signal_type.value,
+                block_reason,
             )
 
     # Check key level proximity
