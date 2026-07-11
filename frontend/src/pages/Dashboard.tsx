@@ -27,6 +27,7 @@ import { PriceHeader } from "../components/PriceHeader";
 import { SignalBadge } from "../components/SignalBadge";
 import { IndicatorsPanel } from "../components/IndicatorsPanel";
 import { TrendPanel } from "../components/TrendPanel";
+import { MtfConfluencePanel } from "../components/MtfConfluencePanel";
 import { FearGreedGauge } from "../components/FearGreedGauge";
 import { NewsFeed } from "../components/NewsFeed";
 import { AlertLog } from "../components/AlertLog";
@@ -248,6 +249,9 @@ export function Dashboard() {
 
             {/* Multi-timeframe: TREND (4H) vs ENTRY (1M) */}
             <TrendPanel snapshot1m={indicators} />
+
+            {/* Confluence filter: 15m/30m/1h/2h agreement gate */}
+            <MtfConfluencePanel />
 
             {/* 1M Indicators detail */}
             <IndicatorsPanel snapshot={indicators} />

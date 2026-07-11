@@ -2,7 +2,10 @@
 Binance WebSocket client for live BTC/USDT price data.
 
 Subscribes to:
-  - kline_1m stream  → 1-minute OHLCV candles
+  - kline_1m stream  → 1-minute OHLCV candles (entry timing)
+  - kline_4h stream  → 4-hour OHLCV candles (macro trend gate)
+  - kline_15m/30m/1h/2h streams → multi-timeframe confluence (optional,
+    only subscribed when mtf_calculators is supplied)
   - bookTicker stream → real-time best bid/ask
   - aggTrade stream   → individual trade events (for volume analysis)
 
@@ -59,15 +62,29 @@ class BinanceWebSocketClient:
         self,
         calculator: IndicatorCalculator,
         calculator_4h: Optional[IndicatorCalculator] = None,
+        mtf_calculators: Optional[dict[str, IndicatorCalculator]] = None,
     ) -> None:
+        """
+        mtf_calculators: optional {"15m": calc, "30m": calc, "1h": calc, "2h": calc}
+        for multi-timeframe confluence — each gets its own kline_<tf> stream,
+        REST preload, and closed-candle callback, generalising the pattern
+        already used for the 4H trend gate.
+        """
         self._calculator = calculator
         self._calculator_4h = calculator_4h
+        self._mtf_calculators: dict[str, IndicatorCalculator] = mtf_calculators or {}
         self._candle_callbacks: list[Callable[[Candle, IndicatorSnapshot], Awaitable[None]]] = []
         self._4h_candle_callbacks: list[
             Callable[[Candle, IndicatorSnapshot], Awaitable[None]]
         ] = []
+        self._mtf_candle_callbacks: dict[
+            str, list[Callable[[Candle, IndicatorSnapshot], Awaitable[None]]]
+        ] = {tf: [] for tf in self._mtf_calculators}
         self._tick_callbacks: list[Callable[[dict], Awaitable[None]]] = []
         self._last_4h_closed_ts: Optional[pd.Timestamp] = None
+        self._mtf_last_closed_ts: dict[str, Optional[pd.Timestamp]] = {
+            tf: None for tf in self._mtf_calculators
+        }
         self._running = False
         self._latest_price: Optional[float] = None
         self._latest_price_time: Optional[float] = None
@@ -87,6 +104,15 @@ class BinanceWebSocketClient:
     ) -> None:
         """Register an async callback fired when a 4-hour candle closes."""
         self._4h_candle_callbacks.append(callback)
+
+    def on_mtf_candle_closed(
+        self,
+        timeframe: str,
+        callback: Callable[[Candle, IndicatorSnapshot], Awaitable[None]],
+    ) -> None:
+        """Register an async callback fired when a candle closes on one of
+        the optional multi-timeframe confluence streams (e.g. "15m")."""
+        self._mtf_candle_callbacks.setdefault(timeframe, []).append(callback)
 
     def on_price_tick(self, callback: Callable[[dict], Awaitable[None]]) -> None:
         """Register an async callback fired on every bookTicker update."""
@@ -230,6 +256,61 @@ class BinanceWebSocketClient:
         logger.warning("Could not preload 4H candles from any endpoint")
         return 0
 
+    async def preload_mtf_candles(self, timeframe: str, limit: int = 200) -> int:
+        """Fetch the last `limit` closed candles for one of the optional
+        multi-timeframe confluence intervals (e.g. "15m") and push them into
+        its dedicated IndicatorCalculator. Generalises preload_4h_candles."""
+        calc = self._mtf_calculators.get(timeframe)
+        if calc is None:
+            return 0
+
+        self._mtf_last_closed_ts[timeframe] = None
+        import httpx
+
+        endpoints = (
+            [REST_BASE_US, REST_BASE_COM]
+            if settings.BINANCE_USE_US_ENDPOINT
+            else [REST_BASE_COM, REST_BASE_US]
+        )
+        params = {"symbol": SYMBOL_UPPER, "interval": timeframe, "limit": limit}
+
+        for base in endpoints:
+            url = f"{base}/api/v3/klines"
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(url, params=params)
+                    resp.raise_for_status()
+                    klines = resp.json()
+
+                count = 0
+                last_closed: Optional[pd.Timestamp] = None
+                for k in klines[:-1]:  # skip the current (still open) candle
+                    candle = Candle(
+                        timestamp=pd.Timestamp(k[0], unit="ms", tz="UTC"),
+                        open=float(k[1]),
+                        high=float(k[2]),
+                        low=float(k[3]),
+                        close=float(k[4]),
+                        volume=float(k[7]),
+                    )
+                    calc.push_candle(candle)
+                    last_closed = candle.timestamp
+                    count += 1
+                if last_closed is not None:
+                    self._mtf_last_closed_ts[timeframe] = last_closed
+
+                logger.info(
+                    "Preloaded %d × %s candles from %s — confluence indicator ready",
+                    count, timeframe, base,
+                )
+                return count
+
+            except Exception as exc:
+                logger.warning("%s candle preload failed from %s: %s", timeframe, base, exc)
+
+        logger.warning("Could not preload %s candles from any endpoint", timeframe)
+        return 0
+
     async def run(self, skip_preload: bool = False) -> None:
         """
         Start the WebSocket connection loop.  Reconnects indefinitely with
@@ -242,6 +323,8 @@ class BinanceWebSocketClient:
         if not skip_preload:
             await self.preload_historical_candles(limit=50)
             await self.preload_4h_candles(limit=200)
+            for tf in self._mtf_calculators:
+                await self.preload_mtf_candles(tf, limit=200)
 
         while self._running:
             attempt += 1
@@ -278,6 +361,8 @@ class BinanceWebSocketClient:
             f"{SYMBOL}@bookTicker",
             f"{SYMBOL}@aggTrade",
         ]
+        for tf in self._mtf_calculators:
+            streams.append(f"{SYMBOL}@kline_{tf}")
         return f"{base}?streams={'/'.join(streams)}"
 
     async def _connect(self) -> None:
@@ -317,6 +402,11 @@ class BinanceWebSocketClient:
             await self._handle_book_ticker(data)
         elif "@aggTrade" in stream_name:
             await self._handle_agg_trade(data)
+        else:
+            for tf in self._mtf_calculators:
+                if f"@kline_{tf}" in stream_name:
+                    await self._handle_kline_mtf(tf, data)
+                    break
 
     async def _handle_kline(self, data: dict) -> None:
         """
@@ -399,6 +489,49 @@ class BinanceWebSocketClient:
                 await cb(candle, snapshot)
             except Exception as exc:
                 logger.error("4H candle callback error: %s", exc, exc_info=True)
+
+    async def _handle_kline_mtf(self, timeframe: str, data: dict) -> None:
+        """Push closed candles into a multi-timeframe confluence calculator.
+        Generalises _handle_kline_4h for the 15m/30m/1h/2h streams."""
+        calc = self._mtf_calculators.get(timeframe)
+        if calc is None:
+            return
+
+        k = data.get("k", {})
+        if not k.get("x"):
+            return
+
+        try:
+            candle = Candle(
+                timestamp=pd.Timestamp(k["t"], unit="ms", tz="UTC"),
+                open=float(k["o"]),
+                high=float(k["h"]),
+                low=float(k["l"]),
+                close=float(k["c"]),
+                volume=float(k["q"]),
+            )
+        except (KeyError, ValueError) as exc:
+            logger.error("Malformed %s kline payload: %s — %s", timeframe, k, exc)
+            return
+
+        last_ts = self._mtf_last_closed_ts.get(timeframe)
+        if last_ts is not None and candle.timestamp <= last_ts:
+            return
+
+        self._mtf_last_closed_ts[timeframe] = candle.timestamp
+        snapshot = calc.push_candle(candle)
+        logger.debug(
+            "%s candle closed via WebSocket: close=%.2f rsi=%.1f",
+            timeframe,
+            candle.close,
+            snapshot.rsi_14 if snapshot.rsi_14 else 0,
+        )
+
+        for cb in self._mtf_candle_callbacks.get(timeframe, []):
+            try:
+                await cb(candle, snapshot)
+            except Exception as exc:
+                logger.error("%s candle callback error: %s", timeframe, exc, exc_info=True)
 
     async def _handle_book_ticker(self, data: dict) -> None:
         """Update the latest best-bid/ask price from bookTicker events."""

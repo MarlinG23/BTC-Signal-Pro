@@ -47,10 +47,28 @@ logger = logging.getLogger(__name__)
 
 # ── Shared singletons ─────────────────────────────────────────────────────────
 calculator = IndicatorCalculator()        # 1-minute candles (entry timing)
-calculator_4h = IndicatorCalculator()     # 4-hour candles  (trend direction)
-signal_engine = SignalEngine()
+calculator_4h = IndicatorCalculator()     # 4-hour candles  (macro trend gate)
+
+# Multi-timeframe confluence — validated via backtest (30/60/90-day windows
+# all positive) to reduce false entries the 4H gate alone lets through.
+# Requires MIN_MTF_AGREEMENT of these 4 timeframes to agree with a signal's
+# direction before it fires. Research: backend/signals/backtester.py
+# min_mtf_agreement option.
+MTF_TIMEFRAMES = ("15m", "30m", "1h", "2h")
+MIN_MTF_AGREEMENT = 1
+calculators_mtf: dict[str, IndicatorCalculator] = {
+    tf: IndicatorCalculator() for tf in MTF_TIMEFRAMES
+}
+
+# Regime filter — validated alongside MTF confluence; skips evaluation when
+# the market is too flat/choppy to be worth trading (ATR/price below this).
+SIGNAL_MIN_ATR_PCT = 0.001
+
+signal_engine = SignalEngine(min_atr_pct=SIGNAL_MIN_ATR_PCT)
 alert_manager = AlertManager(db_session_factory=AsyncSessionLocal)
-binance_ws = BinanceWebSocketClient(calculator, calculator_4h=calculator_4h)
+binance_ws = BinanceWebSocketClient(
+    calculator, calculator_4h=calculator_4h, mtf_calculators=calculators_mtf
+)
 sentiment_analyzer = SentimentAnalyzer()
 fake_news_filter = FakeNewsFilter()
 
@@ -65,6 +83,10 @@ FEAR_GREED_STALE_SECONDS = 70 * 60  # poll alive if updated within 70 min
 # 4H candle periodic refresh — REST safety net; live updates come from kline_4h WS.
 _4h_last_refreshed: Optional[datetime] = None
 _4H_REFRESH_INTERVAL_S = 300  # 5 minutes (backup resync only)
+
+# MTF confluence periodic refresh — same REST safety net as 4H, generalised.
+_mtf_last_refreshed: dict[str, Optional[datetime]] = {tf: None for tf in MTF_TIMEFRAMES}
+_MTF_REFRESH_INTERVAL_S = 300  # 5 minutes (backup resync only)
 
 # Research param-sweep job state (in-memory, single process)
 _sweep_task: Optional[asyncio.Task] = None
@@ -123,6 +145,12 @@ async def lifespan(app: FastAPI):
     logger.info("Preloaded %d × 4H candles", loaded_4h)
     _4h_last_refreshed = datetime.now(timezone.utc)
 
+    # 3b. Preload 200 × each MTF confluence timeframe (15m/30m/1h/2h)
+    for tf in MTF_TIMEFRAMES:
+        loaded_tf = await binance_ws.preload_mtf_candles(tf, limit=200)
+        logger.info("Preloaded %d × %s candles", loaded_tf, tf)
+        _mtf_last_refreshed[tf] = datetime.now(timezone.utc)
+
     # 4. Fetch Fear & Greed immediately on startup
     await _refresh_fear_greed()
 
@@ -133,6 +161,8 @@ async def lifespan(app: FastAPI):
     binance_ws.on_candle_closed(_on_candle_closed)
     binance_ws.on_4h_candle_closed(_on_4h_candle_closed)
     binance_ws.on_price_tick(_on_price_tick)
+    for tf in MTF_TIMEFRAMES:
+        binance_ws.on_mtf_candle_closed(tf, _make_mtf_candle_closed_handler(tf))
 
     # 6. Start Binance WebSocket (preload already done above)
     ws_task = asyncio.create_task(binance_ws.run(skip_preload=True), name="binance-ws")
@@ -153,6 +183,7 @@ async def lifespan(app: FastAPI):
         _fear_greed_poll_task.cancelled(),
     )
     refresh_4h_task = asyncio.create_task(_4h_refresh_loop(), name="4h-refresh")
+    refresh_mtf_task = asyncio.create_task(_mtf_refresh_loop(), name="mtf-refresh")
     fallback_task = asyncio.create_task(_price_fallback_loop(), name="price-fallback")
     outcome_task = asyncio.create_task(_outcome_check_loop(), name="outcome-check")
 
@@ -173,11 +204,12 @@ async def lifespan(app: FastAPI):
     news_task.cancel()
     fear_greed_task.cancel()
     refresh_4h_task.cancel()
+    refresh_mtf_task.cancel()
     fallback_task.cancel()
     outcome_task.cancel()
     try:
         await asyncio.gather(
-            ws_task, news_task, fear_greed_task, refresh_4h_task,
+            ws_task, news_task, fear_greed_task, refresh_4h_task, refresh_mtf_task,
             fallback_task, outcome_task,
             return_exceptions=True,
         )
@@ -245,6 +277,10 @@ async def get_system_status(db: AsyncSession = Depends(get_db)):
         "candles_1m": calculator.candle_count(),
         "candles_4h": calculator_4h.candle_count(),
         "4h_last_refreshed": _4h_last_refreshed.isoformat() if _4h_last_refreshed else None,
+        "candles_mtf": {tf: calc.candle_count() for tf, calc in calculators_mtf.items()},
+        "mtf_last_refreshed": {
+            tf: (ts.isoformat() if ts else None) for tf, ts in _mtf_last_refreshed.items()
+        },
         "last_news_fetch": _last_news_fetch.isoformat() if _last_news_fetch else None,
         "news_count": _news_count,
         "fear_greed": _latest_fear_greed.get("value") if _latest_fear_greed else None,
@@ -277,6 +313,39 @@ async def get_indicators_4h():
     d = _snapshot_to_dict(snap)
     d["candles_buffered"] = calculator_4h.candle_count()
     return d
+
+
+@app.get("/api/indicators/mtf")
+async def get_indicators_mtf():
+    """Return indicator snapshots + trend direction for every multi-timeframe
+    confluence interval (15m/30m/1h/2h), plus the current agreement counts
+    that would apply to a hypothetical BUY or SELL signal right now."""
+    timeframes: dict[str, dict] = {}
+    for tf, calc in calculators_mtf.items():
+        snap = calc.get_snapshot()
+        trend = _trend_direction_from_snapshot(snap)
+        entry: dict = {
+            "trend": trend,
+            "trend_label": _trend_label(trend),
+            "candles_buffered": calc.candle_count(),
+            "last_refreshed": (
+                _mtf_last_refreshed[tf].isoformat() if _mtf_last_refreshed.get(tf) else None
+            ),
+        }
+        if snap is not None:
+            entry.update(_snapshot_to_dict(snap))
+        timeframes[tf] = entry
+
+    buy_agree, _ = _get_mtf_agreement(is_bullish=True, is_bearish=False)
+    sell_agree, _ = _get_mtf_agreement(is_bullish=False, is_bearish=True)
+
+    return {
+        "timeframes": timeframes,
+        "min_agreement_required": MIN_MTF_AGREEMENT,
+        "total_timeframes": len(MTF_TIMEFRAMES),
+        "current_buy_agreement": buy_agree,
+        "current_sell_agreement": sell_agree,
+    }
 
 
 @app.get("/api/fear-greed")
@@ -942,20 +1011,19 @@ async def websocket_endpoint(websocket: WebSocket):
 # ── Background task callbacks ─────────────────────────────────────────────────
 
 
-def _get_4h_trend_direction() -> int:
+def _trend_direction_from_snapshot(snap: Optional[IndicatorSnapshot]) -> int:
     """
-    Derive the 4-hour trend direction from the 4H IndicatorCalculator.
+    Shared trend-direction rule used by the 4H gate AND every MTF confluence
+    timeframe (and mirrored in backend/signals/backtester.py + the
+    frontend's deriveTrend()) so "bullish"/"bearish" means the same thing
+    everywhere in the app.
 
     Returns +1 (bullish), -1 (bearish), or 0 (neutral/insufficient data).
-
-    Logic: uses the same EMA alignment and RSI checks as the 1M engine but
-    on 4H data.  The 4H trend must agree with a 1M signal before it fires.
 
       Bullish  (+1): price > EMA20 > EMA50  AND  RSI < 70
       Bearish  (-1): price < EMA20 < EMA50  AND  RSI > 30
       Neutral   (0): mixed or insufficient data
     """
-    snap = calculator_4h.get_snapshot()
     if snap is None or snap.close_price is None:
         return 0
 
@@ -972,6 +1040,25 @@ def _get_4h_trend_direction() -> int:
     if p < e20 < e50 and (rsi is None or rsi > 30):
         return -1
     return 0
+
+
+def _get_4h_trend_direction() -> int:
+    """Derive the 4-hour trend direction from the 4H IndicatorCalculator.
+    The 4H trend must agree with a 1M signal before it fires."""
+    return _trend_direction_from_snapshot(calculator_4h.get_snapshot())
+
+
+def _get_mtf_agreement(is_bullish: bool, is_bearish: bool) -> tuple[int, dict[str, int]]:
+    """Count how many MTF confluence timeframes agree with a signal's
+    direction. Returns (agreement_count, {timeframe: trend_direction})."""
+    trends: dict[str, int] = {}
+    agree = 0
+    for tf, calc in calculators_mtf.items():
+        trend = _trend_direction_from_snapshot(calc.get_snapshot())
+        trends[tf] = trend
+        if (is_bullish and trend == +1) or (is_bearish and trend == -1):
+            agree += 1
+    return agree, trends
 
 
 def _trend_label(trend: int) -> str:
@@ -992,6 +1079,8 @@ def _build_gate_block_reason(
     fg_value: Optional[int],
     trend_confirms: bool,
     fg_allows: bool,
+    mtf_agree: int = 0,
+    mtf_confirms: bool = True,
 ) -> str:
     """Explain why a 1M signal was blocked (visibility only — gates unchanged)."""
     parts: list[str] = []
@@ -1002,6 +1091,11 @@ def _build_gate_block_reason(
             parts.append(f"1M={signal_type} but F&G={fg_value} too high for BUY")
         elif signal_is_bearish:
             parts.append(f"1M={signal_type} but F&G={fg_value} too low for SELL")
+    if not mtf_confirms:
+        parts.append(
+            f"1M={signal_type} but only {mtf_agree}/{len(MTF_TIMEFRAMES)} "
+            f"timeframes ({', '.join(MTF_TIMEFRAMES)}) agree — need {MIN_MTF_AGREEMENT}"
+        )
     return "; ".join(parts) if parts else "Gate blocked"
 
 
@@ -1015,6 +1109,21 @@ async def _on_4h_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> N
         candle.close,
         trend,
     )
+
+
+def _make_mtf_candle_closed_handler(timeframe: str):
+    """Closure so each MTF timeframe's closed-candle callback updates the
+    right freshness timestamp — generalises _on_4h_candle_closed."""
+
+    async def _handler(candle: Candle, snapshot: IndicatorSnapshot) -> None:
+        _mtf_last_refreshed[timeframe] = datetime.now(timezone.utc)
+        trend = _trend_direction_from_snapshot(snapshot)
+        logger.info(
+            "%s trend live update: close=%.2f direction=%+d",
+            timeframe, candle.close, trend,
+        )
+
+    return _handler
 
 
 async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None:
@@ -1072,7 +1181,18 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
                     "SELL signal blocked: Fear & Greed=%d (need > 60 for SELL)", fg_value
                 )
 
-        if trend_confirms and fg_allows:
+        # Step 4: multi-timeframe confluence — validated via backtest to
+        # reduce false entries the 4H+F&G gates alone let through.
+        mtf_agree, mtf_trends = _get_mtf_agreement(signal_is_bullish, signal_is_bearish)
+        mtf_confirms = mtf_agree >= MIN_MTF_AGREEMENT
+        if not mtf_confirms:
+            logger.info(
+                "%s signal blocked: only %d/%d MTF timeframes agree (need %d) — %s",
+                signal.signal_type.value, mtf_agree, len(MTF_TIMEFRAMES),
+                MIN_MTF_AGREEMENT, mtf_trends,
+            )
+
+        if trend_confirms and fg_allows and mtf_confirms:
             signal_id = await _persist_signal(signal)
             await alert_manager.fire_signal_alert(signal)
             sig_dict = {
@@ -1080,11 +1200,13 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
                 "type": "signal",
                 "trend_4h": trend,
                 "fear_greed": fg_value,
+                "mtf_agreement": mtf_agree,
             }
             await alert_manager.ws_broadcaster.broadcast(sig_dict)
             logger.info(
-                "Signal fired: %s conf=%.1f%% 4H_trend=%+d F&G=%s",
+                "Signal fired: %s conf=%.1f%% 4H_trend=%+d F&G=%s MTF=%d/%d",
                 signal.signal_type.value, signal.confidence, trend, fg_value,
+                mtf_agree, len(MTF_TIMEFRAMES),
             )
         else:
             block_reason = _build_gate_block_reason(
@@ -1095,6 +1217,8 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
                 fg_value=fg_value,
                 trend_confirms=trend_confirms,
                 fg_allows=fg_allows,
+                mtf_agree=mtf_agree,
+                mtf_confirms=mtf_confirms,
             )
             wait_dict = {
                 **signal.to_dict(),
@@ -1102,6 +1226,7 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
                 "display_state": "WAIT",
                 "trend_4h": trend,
                 "fear_greed": fg_value,
+                "mtf_agreement": mtf_agree,
                 "block_reason": block_reason,
             }
             await alert_manager.ws_broadcaster.broadcast(wait_dict)
@@ -1362,6 +1487,50 @@ async def _4h_refresh_loop() -> None:
             break
         except Exception as exc:
             logger.error("4H refresh loop error: %s", exc, exc_info=True)
+
+
+async def _refresh_mtf_candles(timeframe: str) -> bool:
+    """Re-fetch the latest 200 candles for one MTF confluence timeframe from
+    Binance REST — same REST safety net as _refresh_4h_candles, generalised.
+    """
+    calc = calculators_mtf.get(timeframe)
+    if calc is None:
+        return False
+    try:
+        calc.reset()
+        loaded = await binance_ws.preload_mtf_candles(timeframe, limit=200)
+        if loaded > 0:
+            snap = calc.get_snapshot()
+            logger.info(
+                "%s candles refreshed: latest close=%.2f at %s",
+                timeframe, snap.close_price if snap else 0.0, snap.timestamp if snap else None,
+            )
+            _mtf_last_refreshed[timeframe] = datetime.now(timezone.utc)
+            return True
+        logger.warning("%s candle refresh returned 0 candles — keeping stale data", timeframe)
+        return False
+    except Exception as exc:
+        logger.error("%s candle refresh failed: %s", timeframe, exc, exc_info=True)
+        return False
+
+
+async def _mtf_refresh_loop() -> None:
+    """Background loop: REST resync of all MTF confluence timeframes every
+    5 minutes. Primary updates arrive via their kline WebSocket streams;
+    this catches drift after reconnects or missed events (same rationale
+    as _4h_refresh_loop — the original stale-4H-trend bug is exactly the
+    failure mode this guards against for the newer timeframes too)."""
+    logger.info("MTF refresh loop started (interval=%ds)", _MTF_REFRESH_INTERVAL_S)
+    while True:
+        try:
+            await asyncio.sleep(_MTF_REFRESH_INTERVAL_S)
+            for tf in MTF_TIMEFRAMES:
+                await _refresh_mtf_candles(tf)
+        except asyncio.CancelledError:
+            logger.info("MTF refresh loop cancelled")
+            break
+        except Exception as exc:
+            logger.error("MTF refresh loop error: %s", exc, exc_info=True)
             await asyncio.sleep(60)
 
 

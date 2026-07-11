@@ -62,6 +62,23 @@ export interface WaitSignal {
   block_reason: string;
   trend_4h?: number;
   fear_greed?: number | null;
+  mtf_agreement?: number;
+}
+
+/** One multi-timeframe confluence interval (15m/30m/1h/2h) — GET /api/indicators/mtf */
+export interface MtfTimeframeSnapshot extends Partial<IndicatorSnapshot> {
+  trend: 1 | -1 | 0;
+  trend_label: "BULLISH" | "BEARISH" | "NEUTRAL";
+  candles_buffered: number;
+  last_refreshed: string | null;
+}
+
+export interface MtfIndicatorsResponse {
+  timeframes: Record<string, MtfTimeframeSnapshot>;
+  min_agreement_required: number;
+  total_timeframes: number;
+  current_buy_agreement: number;
+  current_sell_agreement: number;
 }
 
 export interface NewsItem {
