@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -73,10 +74,16 @@ _sweep_running = False
 
 # Research single-backtest job state — separate from the sweep job so a
 # long single backtest (e.g. 60-90 day windows) doesn't collide with sweeps.
+# job_id lets callers verify a polled result actually belongs to the request
+# they made — without it, a second async request that arrives while a
+# different job is still running would silently receive that other job's
+# result once it completes ("running" is returned without ever queuing the
+# newer request), which previously caused corrupted/stale-looking numbers.
 _backtest_job_task: Optional[asyncio.Task] = None
 _backtest_job_result: Optional[dict] = None
 _backtest_job_error: Optional[str] = None
 _backtest_job_running = False
+_backtest_job_id: Optional[str] = None
 
 # Startup / status tracking
 _startup_ready = False
@@ -668,10 +675,13 @@ async def run_backtest(
     with the signal's direction before it counts as gated. 0-4.
 
     async_run=true (recommended for windows beyond ~30-45 days, which can
-    exceed Railway's ~5min proxy timeout) returns immediately; poll
-    GET /api/admin/backtest/status for the result.
+    exceed Railway's ~5min proxy timeout) returns immediately with a job_id;
+    poll GET /api/admin/backtest/status?job_id=... for the result. If a
+    different job is already running, this returns status="busy" instead of
+    silently queuing — callers must wait and retry rather than risk reading
+    someone else's in-flight result.
     """
-    global _backtest_job_task, _backtest_job_running, _backtest_job_result, _backtest_job_error
+    global _backtest_job_task, _backtest_job_running, _backtest_job_result, _backtest_job_error, _backtest_job_id
 
     if days < 1 or days > 180:
         raise HTTPException(status_code=400, detail="days must be between 1 and 180.")
@@ -698,7 +708,13 @@ async def run_backtest(
 
     if async_run:
         if _backtest_job_running:
-            return {"status": "running", "poll": "/api/admin/backtest/status"}
+            return {
+                "status": "busy",
+                "message": "A different backtest job is already running. Wait and retry.",
+                "poll": "/api/admin/backtest/status",
+            }
+        job_id = str(uuid.uuid4())
+        _backtest_job_id = job_id
         _backtest_job_result = None
         _backtest_job_error = None
         _backtest_job_running = True
@@ -707,7 +723,9 @@ async def run_backtest(
             global _backtest_job_result, _backtest_job_error, _backtest_job_running
             try:
                 async with AsyncSessionLocal() as session:
-                    _backtest_job_result = await _run_backtest_core(days, session, options, gate_mode)
+                    result = await _run_backtest_core(days, session, options, gate_mode)
+                    result["days"] = days
+                    _backtest_job_result = result
             except Exception as exc:
                 logger.error("Background backtest failed: %s", exc, exc_info=True)
                 _backtest_job_error = str(exc)
@@ -715,10 +733,12 @@ async def run_backtest(
                 _backtest_job_running = False
 
         _backtest_job_task = asyncio.create_task(_job(), name="backtest")
-        return {"status": "started", "poll": "/api/admin/backtest/status"}
+        return {"status": "started", "job_id": job_id, "poll": "/api/admin/backtest/status"}
 
     try:
-        return await _run_backtest_core(days, db, options, gate_mode)
+        result = await _run_backtest_core(days, db, options, gate_mode)
+        result["days"] = days
+        return result
     except HTTPException:
         raise
     except Exception as exc:
@@ -727,14 +747,22 @@ async def run_backtest(
 
 
 @app.get("/api/admin/backtest/status")
-async def admin_backtest_status():
-    """Poll background single-backtest job status and result."""
+async def admin_backtest_status(job_id: Optional[str] = None):
+    """Poll background single-backtest job status and result.
+
+    Pass the job_id returned by the "started" response to verify the result
+    you receive actually belongs to your request. If job_id is provided and
+    doesn't match the current/last job, returns status="unknown_job" instead
+    of a possibly-unrelated result.
+    """
+    if job_id is not None and job_id != _backtest_job_id:
+        return {"status": "unknown_job", "message": "job_id does not match any known job."}
     if _backtest_job_running:
-        return {"status": "running"}
+        return {"status": "running", "job_id": _backtest_job_id}
     if _backtest_job_error:
-        return {"status": "error", "error": _backtest_job_error}
+        return {"status": "error", "error": _backtest_job_error, "job_id": _backtest_job_id}
     if _backtest_job_result:
-        return {"status": "complete", "result": _backtest_job_result}
+        return {"status": "complete", "result": _backtest_job_result, "job_id": _backtest_job_id}
     return {"status": "idle"}
 
 
