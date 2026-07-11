@@ -625,6 +625,7 @@ async def _run_backtest_core(days: int, db: AsyncSession, options: BacktestOptio
         "sequential_only": options.sequential_only,
         "min_atr_pct": options.min_atr_pct,
         "use_trailing_exit": options.use_trailing_exit,
+        "min_mtf_agreement": options.min_mtf_agreement,
     }
 
 
@@ -643,6 +644,7 @@ async def run_backtest(
     trailing_activation_pct: float = 0.004,
     trailing_distance_pct: float = 0.003,
     trailing_max_hold_bars: int = 180,
+    min_mtf_agreement: Optional[int] = None,
     async_run: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
@@ -661,6 +663,10 @@ async def run_backtest(
     use_trailing_exit replaces the fixed take-profit with a trailing stop
     that only activates after a favorable move ("let winners run").
 
+    min_mtf_agreement requires at least N of {15m,30m,1h,2h} timeframes
+    (resampled from the same 1M history — no extra data source) to agree
+    with the signal's direction before it counts as gated. 0-4.
+
     async_run=true (recommended for windows beyond ~30-45 days, which can
     exceed Railway's ~5min proxy timeout) returns immediately; poll
     GET /api/admin/backtest/status for the result.
@@ -671,6 +677,8 @@ async def run_backtest(
         raise HTTPException(status_code=400, detail="days must be between 1 and 180.")
     if gate_mode not in ("full", "4h_only", "fg_only", "none"):
         raise HTTPException(status_code=400, detail="Invalid gate_mode.")
+    if min_mtf_agreement is not None and not (0 <= min_mtf_agreement <= 4):
+        raise HTTPException(status_code=400, detail="min_mtf_agreement must be between 0 and 4.")
 
     options = BacktestOptions(
         taker_fee_pct=taker_fee_pct,
@@ -685,6 +693,7 @@ async def run_backtest(
         trailing_activation_pct=trailing_activation_pct,
         trailing_distance_pct=trailing_distance_pct,
         trailing_max_hold_bars=trailing_max_hold_bars,
+        min_mtf_agreement=min_mtf_agreement,
     )
 
     if async_run:

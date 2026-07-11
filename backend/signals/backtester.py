@@ -62,6 +62,11 @@ class BacktestOptions:
     trailing_activation_pct: float = 0.004  # favorable move required before trailing starts
     trailing_distance_pct: float = 0.003  # trail distance behind the high/low-water mark once active
     trailing_max_hold_bars: int = 180  # wider hold window than the default fixed-TP simulation
+    # Multi-timeframe confluence (research-only): resamples the 1M df into
+    # higher timeframes and requires N of them to agree with the signal's
+    # direction before it counts as gated. None disables the filter entirely.
+    min_mtf_agreement: Optional[int] = None
+    mtf_timeframes: tuple = ("15min", "30min", "1h", "2h")
 
 
 @dataclass
@@ -126,6 +131,7 @@ class BacktestResult:
     gated_skipped_while_in_position: int = 0
     signals_blocked_by_4h_trend: int = 0
     signals_blocked_by_fg: int = 0
+    signals_blocked_by_mtf: int = 0
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -159,6 +165,7 @@ class BacktestResult:
                 "skipped_while_in_position": self.gated_skipped_while_in_position,
                 "signals_blocked_by_4h_trend": self.signals_blocked_by_4h_trend,
                 "signals_blocked_by_fg": self.signals_blocked_by_fg,
+                "signals_blocked_by_mtf": self.signals_blocked_by_mtf,
             }
         return d
 
@@ -310,8 +317,13 @@ class BacktestEngine:
             else:
                 fg_lookup, fg_dates = {}, []
 
+            mtf_timelines: dict = {}
+            if opts.min_mtf_agreement is not None:
+                mtf_timelines = self._build_mtf_trend_timelines(df, opts.mtf_timeframes)
+
             blocked_trend = 0
             blocked_fg = 0
+            blocked_mtf = 0
             gated_signals: list[tuple[int, SignalResult]] = []
 
             for bar_idx, signal in signals_fired:
@@ -345,6 +357,12 @@ class BacktestEngine:
                         blocked_fg += 1
                         continue
 
+                if opts.min_mtf_agreement is not None:
+                    agree = self._mtf_agreement_count(mtf_timelines, signal_time, is_bullish)
+                    if agree < opts.min_mtf_agreement:
+                        blocked_mtf += 1
+                        continue
+
                 gated_signals.append((bar_idx, signal))
 
             gated_trades, gated_skipped = self._simulate_trades(
@@ -373,6 +391,7 @@ class BacktestEngine:
             result.gated_skipped_while_in_position = gated_skipped
             result.signals_blocked_by_4h_trend = blocked_trend
             result.signals_blocked_by_fg = blocked_fg
+            result.signals_blocked_by_mtf = blocked_mtf
 
         return result
 
@@ -602,22 +621,25 @@ class BacktestEngine:
 
         return result
 
-    # ── 4H trend gate helpers ─────────────────────────────────────────────
+    # ── Trend gate helpers (timeframe-agnostic) ──────────────────────────
 
-    def _build_4h_trend_timeline(
-        self, df_4h: pd.DataFrame
+    def _build_trend_timeline(
+        self, df_tf: pd.DataFrame, label: str = "trend"
     ) -> tuple[dict, list]:
-        """Replay 4H candles through a fresh IndicatorCalculator and record
-        the trend direction at each closed candle.
+        """Replay OHLCV candles for any timeframe through a fresh
+        IndicatorCalculator and record the trend direction at each closed
+        candle, using the same rule as the live 4H gate and the frontend's
+        deriveTrend(): price > EMA20 > EMA50 (+ RSI<70) = bullish,
+        price < EMA20 < EMA50 (+ RSI>30) = bearish, else neutral.
 
         Returns ``(trend_map, sorted_timestamps)`` where
         ``trend_map[ts] = +1 | 0 | -1`` and ``sorted_timestamps`` is the
-        sorted list of 4H close times for binary-search lookups.
+        sorted list of close times for binary-search lookups.
         """
         calc = IndicatorCalculator()
         trend_map: dict = {}
 
-        for timestamp, row in df_4h.iterrows():
+        for timestamp, row in df_tf.iterrows():
             candle = Candle(
                 timestamp=timestamp,
                 open=float(row["open"]),
@@ -638,12 +660,17 @@ class BacktestEngine:
 
         sorted_ts = sorted(trend_map.keys())
         logger.info(
-            "4H trend timeline built: %d candles, %d bullish, %d bearish",
+            "%s trend timeline built: %d candles, %d bullish, %d bearish",
+            label,
             len(sorted_ts),
             sum(1 for v in trend_map.values() if v == +1),
             sum(1 for v in trend_map.values() if v == -1),
         )
         return trend_map, sorted_ts
+
+    # Backward-compatible alias — 4H is just one timeframe among many now.
+    def _build_4h_trend_timeline(self, df_4h: pd.DataFrame) -> tuple[dict, list]:
+        return self._build_trend_timeline(df_4h, label="4H")
 
     def _lookup_4h_trend(
         self,
@@ -651,11 +678,58 @@ class BacktestEngine:
         trend_map: dict,
         signal_time,
     ) -> int:
-        """Return the most recent 4H trend direction at or before signal_time."""
+        """Return the most recent trend direction at or before signal_time."""
         idx = bisect.bisect_right(sorted_ts, signal_time) - 1
         if idx < 0:
             return 0
         return trend_map[sorted_ts[idx]]
+
+    # ── Multi-timeframe confluence helpers ───────────────────────────────
+
+    def _resample_ohlcv(self, df_1m: pd.DataFrame, rule: str) -> pd.DataFrame:
+        """Resample 1M OHLCV into a higher timeframe (no extra data source
+        needed — the 1M history we already load covers this)."""
+        out = pd.DataFrame(
+            {
+                "open": df_1m["open"].resample(rule).first(),
+                "high": df_1m["high"].resample(rule).max(),
+                "low": df_1m["low"].resample(rule).min(),
+                "close": df_1m["close"].resample(rule).last(),
+                "volume": df_1m["volume"].resample(rule).sum(),
+            }
+        ).dropna(subset=["open", "high", "low", "close"])
+        return out
+
+    def _build_mtf_trend_timelines(
+        self, df: pd.DataFrame, timeframes: tuple
+    ) -> dict[str, tuple[dict, list]]:
+        """Build a trend timeline for each requested timeframe by resampling
+        the 1M df. Returns {timeframe_label: (trend_map, sorted_ts)}."""
+        timelines: dict[str, tuple[dict, list]] = {}
+        for rule in timeframes:
+            df_tf = self._resample_ohlcv(df, rule)
+            if df_tf.empty:
+                timelines[rule] = ({}, [])
+                continue
+            timelines[rule] = self._build_trend_timeline(df_tf, label=rule)
+        return timelines
+
+    def _mtf_agreement_count(
+        self,
+        timelines: dict[str, tuple[dict, list]],
+        signal_time,
+        is_bullish: bool,
+    ) -> int:
+        """Count how many of the supplied timeframe timelines agree with the
+        signal's direction at signal_time."""
+        agree = 0
+        for _, (trend_map, sorted_ts) in timelines.items():
+            if not sorted_ts:
+                continue
+            trend = self._lookup_4h_trend(sorted_ts, trend_map, signal_time)
+            if (is_bullish and trend == +1) or (not is_bullish and trend == -1):
+                agree += 1
+        return agree
 
     # ── Fear & Greed gate helpers ─────────────────────────────────────────
 

@@ -242,6 +242,42 @@ class TestRegimeFilter:
         assert len(signals_filtered) <= len(signals_normal)
 
 
+class TestMultiTimeframeFilter:
+    def test_min_mtf_agreement_reduces_or_matches_gated_trades(self):
+        np.random.seed(7)
+        engine = BacktestEngine()
+        df = _make_ohlcv_dataframe(600, trend="up")
+        df_4h = df.resample("4h").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna()
+
+        loose = BacktestOptions(gate_mode="4h_only", min_mtf_agreement=0)
+        strict = BacktestOptions(gate_mode="4h_only", min_mtf_agreement=4)
+
+        result_loose = engine.run(df, df_4h=df_4h, options=loose)
+        result_strict = engine.run(df, df_4h=df_4h, options=strict)
+
+        assert result_loose.has_gated_run
+        assert result_strict.has_gated_run
+        # Requiring all 4 timeframes to agree can only keep as many or fewer
+        # trades than requiring none of them to agree.
+        assert result_strict.gated_total_trades <= result_loose.gated_total_trades
+        assert result_strict.signals_blocked_by_mtf >= 0
+
+    def test_min_mtf_agreement_none_is_noop(self):
+        np.random.seed(11)
+        engine = BacktestEngine()
+        df = _make_ohlcv_dataframe(600, trend="up")
+        df_4h = df.resample("4h").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna()
+
+        with_none = engine.run(
+            df, df_4h=df_4h, options=BacktestOptions(gate_mode="4h_only", min_mtf_agreement=None)
+        )
+        assert with_none.signals_blocked_by_mtf == 0
+
+
 class TestDeadzoneAnalysis:
     def test_analyze_deadzone_returns_structure(self):
         np.random.seed(99)
