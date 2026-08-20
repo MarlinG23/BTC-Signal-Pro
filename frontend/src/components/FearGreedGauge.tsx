@@ -9,6 +9,8 @@ import { timeAgoMinutes } from "../utils/format";
 
 interface FearGreedGaugeProps {
   data: FearGreedData | null;
+  /** Compact variant for the Live tab; full gauge stays on News. */
+  compact?: boolean;
 }
 
 function getColor(value: number): string {
@@ -37,17 +39,25 @@ function getArcPath(value: number): string {
   return `M ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2}`;
 }
 
-export function FearGreedGauge({ data }: FearGreedGaugeProps) {
+export function FearGreedGauge({ data, compact = false }: FearGreedGaugeProps) {
   return (
     <div className="card">
-      <h2 className="text-sm font-semibold text-brand-muted uppercase tracking-wider mb-4">
+      <h2
+        className={clsx(
+          "text-sm font-semibold text-brand-muted uppercase tracking-wider",
+          compact ? "mb-2" : "mb-4"
+        )}
+      >
         Fear & Greed Index
       </h2>
 
       {data ? (
         <div className="flex flex-col items-center">
           {/* SVG Gauge */}
-          <svg viewBox="0 0 120 70" className="w-40 h-24">
+          <svg
+            viewBox="0 0 120 70"
+            className={compact ? "w-28 h-16" : "w-40 h-24"}
+          >
             {/* Background track */}
             <path
               d="M 10 60 A 50 50 0 0 1 110 60"
@@ -78,7 +88,7 @@ export function FearGreedGauge({ data }: FearGreedGaugeProps) {
           </svg>
 
           <p
-            className={clsx("text-lg font-bold mt-1")}
+            className={clsx("font-bold mt-1", compact ? "text-sm" : "text-lg")}
             style={{ color: getColor(data.value) }}
           >
             {data.classification}
@@ -87,12 +97,13 @@ export function FearGreedGauge({ data }: FearGreedGaugeProps) {
             Updated {timeAgoMinutes(data.updated_at ?? data.timestamp)}
           </p>
 
-          {/* Scale labels */}
-          <div className="flex justify-between w-full mt-3 text-xs text-brand-muted">
-            <span className="text-red-400">Extreme Fear</span>
-            <span className="text-yellow-400">Neutral</span>
-            <span className="text-emerald-400">Extreme Greed</span>
-          </div>
+          {!compact && (
+            <div className="flex justify-between w-full mt-3 text-xs text-brand-muted">
+              <span className="text-red-400">Extreme Fear</span>
+              <span className="text-yellow-400">Neutral</span>
+              <span className="text-emerald-400">Extreme Greed</span>
+            </div>
+          )}
         </div>
       ) : (
         <div className="flex items-center justify-center py-6 text-brand-muted text-sm">

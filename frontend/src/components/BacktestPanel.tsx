@@ -1,17 +1,12 @@
 /**
- * Backtesting results panel. Fetches stats from the /api/backtest endpoint
- * and displays key metrics in a card grid.
+ * Backtesting results panel. Run state lives in LiveDataProvider so leaving
+ * the Research tab does not wipe a completed backtest.
  */
 
-import { useState } from "react";
 import clsx from "clsx";
 import { PlayCircle, TrendingUp } from "lucide-react";
-import { BacktestResult } from "../utils/types";
 import { fmt, formatPct } from "../utils/format";
-
-interface BacktestPanelProps {
-  apiBase?: string;
-}
+import { useLiveData } from "../context/LiveDataContext";
 
 interface MetricCardProps {
   label: string;
@@ -38,38 +33,15 @@ function MetricCard({ label, value, positive, negative }: MetricCardProps) {
   );
 }
 
-export function BacktestPanel({ apiBase = "" }: BacktestPanelProps) {
-  const [days, setDays] = useState(30);
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<BacktestResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const runBacktest = async () => {
-    setLoading(true);
-    setError(null);
-    setResult(null);
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const res = await fetch(`${apiBase}/api/backtest?days=${days}`);
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          throw new Error((body as { detail?: string }).detail || `HTTP ${res.status}`);
-        }
-        const data = (await res.json()) as BacktestResult;
-        setResult(data);
-        break;
-      } catch (err) {
-        if (attempt === 3) {
-          setError(err instanceof Error ? err.message : "Backtest failed");
-        } else {
-          await new Promise((r) => setTimeout(r, 1000 * attempt));
-        }
-      }
-    }
-
-    setLoading(false);
-  };
+export function BacktestPanel() {
+  const {
+    backtestDays: days,
+    setBacktestDays,
+    backtestResult: result,
+    backtestError: error,
+    backtestLoading: loading,
+    runBacktest,
+  } = useLiveData();
 
   return (
     <div className="card">
@@ -86,7 +58,7 @@ export function BacktestPanel({ apiBase = "" }: BacktestPanelProps) {
           <label className="text-brand-muted text-sm">Days:</label>
           <select
             value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
+            onChange={(e) => setBacktestDays(Number(e.target.value))}
             className="bg-brand-dark border border-brand-border rounded-lg px-3 py-1.5 text-sm text-white"
           >
             {[7, 14, 30, 60, 90, 180].map((d) => (

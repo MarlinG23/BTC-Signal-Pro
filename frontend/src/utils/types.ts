@@ -34,6 +34,8 @@ export interface IndicatorSnapshot {
   atr_14: number | null;
 }
 
+export type Snapshot4H = IndicatorSnapshot & { candles_buffered?: number };
+
 export interface Signal {
   id?: number;
   signal_type: SignalType;

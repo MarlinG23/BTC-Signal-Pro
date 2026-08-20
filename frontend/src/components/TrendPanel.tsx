@@ -4,26 +4,23 @@
  */
 
 import clsx from "clsx";
-import { IndicatorSnapshot } from "../utils/types";
+import { IndicatorSnapshot, Snapshot4H } from "../utils/types";
 import { formatPrice, fmt } from "../utils/format";
-import { useApi } from "../hooks/useApi";
 import { deriveTrend } from "../utils/trend";
 
 interface TrendPanelProps {
   /** 1-minute snapshot for ENTRY context */
   snapshot1m: IndicatorSnapshot | null;
+  /** Shared 4H snapshot from LiveDataProvider — avoids a second poll. */
+  snapshot4h: Snapshot4H | null;
+  loading?: boolean;
 }
 
-interface Snapshot4H extends IndicatorSnapshot {
-  candles_buffered?: number;
-}
-
-export function TrendPanel({ snapshot1m }: TrendPanelProps) {
-  const { data: snap4h, loading } = useApi<Snapshot4H>(
-    "/api/indicators/4h",
-    60_000 // refresh every minute — 4H candles don't change that fast
-  );
-
+export function TrendPanel({
+  snapshot1m,
+  snapshot4h: snap4h,
+  loading = false,
+}: TrendPanelProps) {
   const trend = deriveTrend(snap4h);
 
   const rows: { label: string; val1m: string | null; val4h: string | null }[] = [

@@ -15,7 +15,7 @@ interface PriceHeaderProps {
 
 export function PriceHeader({ price, connected, candles }: PriceHeaderProps) {
   return (
-    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
+    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
       {/* Brand */}
       <div className="flex items-center gap-3">
         <div className="w-10 h-10 rounded-xl bg-brand-green/10 border border-brand-green/30 flex items-center justify-center">
@@ -33,7 +33,7 @@ export function PriceHeader({ price, connected, candles }: PriceHeaderProps) {
           <Activity className="w-4 h-4 text-brand-green" />
           <span
             className={clsx(
-              "text-3xl font-bold font-mono transition-all duration-300",
+              "text-2xl sm:text-3xl font-bold font-mono transition-all duration-300",
               price ? "text-white" : "text-brand-muted"
             )}
           >

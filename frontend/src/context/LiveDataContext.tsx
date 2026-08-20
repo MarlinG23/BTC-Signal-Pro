@@ -1,54 +1,82 @@
 /**
- * Main dashboard page — assembles all components into a responsive layout.
- *
- * Layout:
- *   Mobile (< md):  Single column stack
- *   Desktop (≥ md): 2-column layout
- *
- * Live data flow:
- *   WebSocket → price ticks, indicator updates, signals, alerts, news, fear/greed
- *   REST API  → initial signal history, news history, alert history (polled every 30s)
+ * Session-scoped live data. Stays mounted across tab routes so the
+ * WebSocket, signal beeps, WAIT state, and merged history are not reset
+ * when the user switches categories.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useApi } from "../hooks/useApi";
 import {
   AlertItem,
+  BacktestResult,
   FearGreedData,
   IndicatorSnapshot,
   NewsItem,
   Signal,
+  Snapshot4H,
   WaitSignal,
   WsMessage,
 } from "../utils/types";
-
-import { PriceHeader } from "../components/PriceHeader";
-import { SignalBadge } from "../components/SignalBadge";
-import { IndicatorsPanel } from "../components/IndicatorsPanel";
-import { TrendPanel } from "../components/TrendPanel";
-import { MtfConfluencePanel } from "../components/MtfConfluencePanel";
-import { FearGreedGauge } from "../components/FearGreedGauge";
-import { NewsFeed } from "../components/NewsFeed";
-import { AlertLog } from "../components/AlertLog";
-import { SignalHistory } from "../components/SignalHistory";
-import { BacktestPanel } from "../components/BacktestPanel";
-import { StatusBar } from "../components/StatusBar";
 import { isSignalFresh } from "../utils/signalFreshness";
-import { deriveTrend } from "../utils/trend";
+import { deriveTrend, type TrendLabel } from "../utils/trend";
 import { playSignalBeep, unlockAudio } from "../utils/audio";
 
-export function Dashboard() {
+const API_BASE = import.meta.env.VITE_API_URL || "";
+
+export interface LiveDataValue {
+  livePrice: number | null;
+  candleCount: number;
+  indicators: IndicatorSnapshot | null;
+  snap4h: Snapshot4H | null;
+  snap4hLoading: boolean;
+  trend4h: TrendLabel;
+  connected: boolean;
+  displaySignal: Signal | null;
+  displayWait: WaitSignal | null;
+  fearGreed: FearGreedData | null;
+  allAlerts: AlertItem[];
+  allNews: NewsItem[];
+  historicalSignals: Signal[] | null;
+  signalsLoading: boolean;
+  newsLoading: boolean;
+  backtestDays: number;
+  setBacktestDays: (days: number) => void;
+  backtestResult: BacktestResult | null;
+  backtestError: string | null;
+  backtestLoading: boolean;
+  runBacktest: () => Promise<void>;
+}
+
+const LiveDataContext = createContext<LiveDataValue | null>(null);
+
+export function useLiveData(): LiveDataValue {
+  const ctx = useContext(LiveDataContext);
+  if (!ctx) {
+    throw new Error("useLiveData must be used within LiveDataProvider");
+  }
+  return ctx;
+}
+
+export function LiveDataProvider({ children }: { children: ReactNode }) {
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [candleCount, setCandleCount] = useState(0);
   const [indicators, setIndicators] = useState<IndicatorSnapshot | null>(null);
   const [latestSignal, setLatestSignal] = useState<Signal | null>(null);
   const [latestWait, setLatestWait] = useState<WaitSignal | null>(null);
-  const [fearGreed, setFearGreed] = useState<FearGreedData | null>(null);
+  const [fearGreedWs, setFearGreedWs] = useState<FearGreedData | null>(null);
   const [liveAlerts, setLiveAlerts] = useState<AlertItem[]>([]);
   const [liveNews, setLiveNews] = useState<NewsItem[]>([]);
 
-  // REST data — polled periodically
   const { data: historicalSignals, loading: signalsLoading } = useApi<Signal[]>(
     "/api/signals/latest?limit=20",
     30_000
@@ -61,16 +89,22 @@ export function Dashboard() {
     "/api/alerts/history?limit=50",
     30_000
   );
-  // Fetch Fear & Greed immediately on page load; WS updates will override
   const { data: initialFearGreed } = useApi<FearGreedData>(
     "/api/fear-greed",
-    60_000 // refresh every minute; backend polls hourly
+    60_000
   );
-  const { data: snap4h } = useApi<IndicatorSnapshot>(
+  const { data: snap4h, loading: snap4hLoading } = useApi<Snapshot4H>(
     "/api/indicators/4h",
     60_000
   );
   const trend4h = deriveTrend(snap4h).label;
+
+  const [backtestDays, setBacktestDays] = useState(30);
+  const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(
+    null
+  );
+  const [backtestError, setBacktestError] = useState<string | null>(null);
+  const [backtestLoading, setBacktestLoading] = useState(false);
 
   const nextAlertId = useRef(0);
   const nextNewsId = useRef(-1);
@@ -165,7 +199,7 @@ export function Dashboard() {
       }
 
       case "fear_greed": {
-        setFearGreed({
+        setFearGreedWs({
           value: msg.value as number,
           classification: msg.classification as string,
           timestamp: msg.timestamp as string,
@@ -190,98 +224,115 @@ export function Dashboard() {
     };
   }, []);
 
-  // Merge live alerts with historical
-  const allAlerts: AlertItem[] = [
-    ...liveAlerts,
-    ...(historicalAlerts ?? []),
-  ].slice(0, 50);
+  const runBacktest = useCallback(async () => {
+    setBacktestLoading(true);
+    setBacktestError(null);
+    setBacktestResult(null);
 
-  // Merge live news with historical, deduplicate by title
-  const seenTitles = new Set<string>();
-  const allNews: NewsItem[] = [];
-  for (const item of [...liveNews, ...(historicalNews ?? [])]) {
-    if (!seenTitles.has(item.title)) {
-      seenTitles.add(item.title);
-      allNews.push(item);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch(`${API_BASE}/api/backtest?days=${backtestDays}`);
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(
+            (body as { detail?: string }).detail || `HTTP ${res.status}`
+          );
+        }
+        const data = (await res.json()) as BacktestResult;
+        setBacktestResult(data);
+        break;
+      } catch (err) {
+        if (attempt === 3) {
+          setBacktestError(
+            err instanceof Error ? err.message : "Backtest failed"
+          );
+        } else {
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
+        }
+      }
     }
-  }
 
-  // Use the most recent fresh signal from live WS or historical API (< 5 min)
+    setBacktestLoading(false);
+  }, [backtestDays]);
+
+  const allAlerts: AlertItem[] = useMemo(
+    () => [...liveAlerts, ...(historicalAlerts ?? [])].slice(0, 50),
+    [liveAlerts, historicalAlerts]
+  );
+
+  const allNews: NewsItem[] = useMemo(() => {
+    const seenTitles = new Set<string>();
+    const merged: NewsItem[] = [];
+    for (const item of [...liveNews, ...(historicalNews ?? [])]) {
+      if (!seenTitles.has(item.title)) {
+        seenTitles.add(item.title);
+        merged.push(item);
+      }
+    }
+    return merged;
+  }, [liveNews, historicalNews]);
+
   const candidateSignal =
     latestSignal ?? (historicalSignals && historicalSignals[0]) ?? null;
   const displaySignal =
     candidateSignal && isSignalFresh(candidateSignal.generated_at)
       ? candidateSignal
       : null;
-
   const displayWait =
     latestWait && isSignalFresh(latestWait.generated_at) && !displaySignal
       ? latestWait
       : null;
 
+  const value = useMemo<LiveDataValue>(
+    () => ({
+      livePrice,
+      candleCount,
+      indicators,
+      snap4h: snap4h ?? null,
+      snap4hLoading: snap4hLoading && !snap4h,
+      trend4h,
+      connected,
+      displaySignal,
+      displayWait,
+      fearGreed: fearGreedWs ?? initialFearGreed ?? null,
+      allAlerts,
+      allNews,
+      historicalSignals,
+      signalsLoading,
+      newsLoading,
+      backtestDays,
+      setBacktestDays,
+      backtestResult,
+      backtestError,
+      backtestLoading,
+      runBacktest,
+    }),
+    [
+      livePrice,
+      candleCount,
+      indicators,
+      snap4h,
+      snap4hLoading,
+      trend4h,
+      connected,
+      displaySignal,
+      displayWait,
+      fearGreedWs,
+      initialFearGreed,
+      allAlerts,
+      allNews,
+      historicalSignals,
+      signalsLoading,
+      newsLoading,
+      backtestDays,
+      backtestResult,
+      backtestError,
+      backtestLoading,
+      runBacktest,
+    ]
+  );
+
   return (
-    <div className="min-h-screen bg-brand-dark">
-      <div className="max-w-7xl mx-auto px-4 py-6">
-        {/* Header */}
-        <PriceHeader
-          price={livePrice}
-          connected={connected}
-          candles={candleCount}
-        />
-
-        <StatusBar />
-
-        {/* Main grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          {/* Left column */}
-          <div className="lg:col-span-2 space-y-4">
-            {/* Signal Badge — most prominent element */}
-            <SignalBadge
-              signal={displaySignal}
-              waitSignal={displayWait}
-              trend4h={trend4h}
-              currentPrice={livePrice}
-              atr14={indicators?.atr_14 ?? null}
-              fearGreed={
-                fearGreed?.value ?? initialFearGreed?.value ?? null
-              }
-            />
-
-            {/* Multi-timeframe: TREND (4H) vs ENTRY (1M) */}
-            <TrendPanel snapshot1m={indicators} />
-
-            {/* Confluence filter: 15m/30m/1h/2h agreement gate */}
-            <MtfConfluencePanel />
-
-            {/* 1M Indicators detail */}
-            <IndicatorsPanel snapshot={indicators} />
-
-            {/* Signal History */}
-            <SignalHistory
-              signals={historicalSignals ?? []}
-              loading={signalsLoading}
-            />
-
-            {/* Backtester */}
-            <BacktestPanel />
-          </div>
-
-          {/* Right column */}
-          <div className="space-y-4">
-            {/* Fear & Greed — live WS takes priority; REST fills in on load */}
-            <FearGreedGauge data={fearGreed ?? initialFearGreed ?? null} />
-
-            {/* Alert Log */}
-            <AlertLog alerts={allAlerts} />
-
-            {/* News Feed */}
-            <NewsFeed
-              items={allNews}
-              loading={newsLoading && allNews.length === 0}
-            />
-          </div>
-        </div>
-      </div>
-    </div>
+    <LiveDataContext.Provider value={value}>{children}</LiveDataContext.Provider>
   );
 }
