@@ -306,6 +306,44 @@ async def get_indicators():
     return _snapshot_to_dict(snap)
 
 
+@app.get("/api/candles")
+async def get_candles(
+    interval: str = "1m",
+    limit: int = 200,
+    db: AsyncSession = Depends(get_db),
+):
+    """Closed 1-minute BTCUSDT OHLC bars for the live chart.
+
+    Prefer persisted ``price_candles`` rows. If the table is empty or the
+    query fails, fall back to the in-memory 1m calculator buffer so the
+    chart can still render after a fresh start.
+    """
+    if interval != "1m":
+        raise HTTPException(status_code=400, detail="Only interval=1m is supported.")
+    limit = min(max(int(limit), 1), 500)
+
+    bars: list[dict] = []
+    try:
+        from sqlalchemy import select
+
+        stmt = (
+            select(PriceCandle)
+            .order_by(PriceCandle.open_time.desc())
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        rows = list(result.scalars().all())
+        rows.reverse()
+        bars = [_price_row_to_chart_bar(c) for c in rows]
+    except Exception as exc:
+        logger.error("Failed to fetch candles from DB: %s", exc)
+
+    if not bars:
+        bars = [c.to_chart_bar() for c in calculator.recent_candles(limit)]
+
+    return bars
+
+
 @app.get("/api/indicators/4h")
 async def get_indicators_4h():
     """Return the latest 4-hour indicator snapshot (trend timeframe)."""
@@ -1018,9 +1056,11 @@ async def websocket_endpoint(websocket: WebSocket):
         # Send current state immediately on connect
         snap = calculator.get_snapshot()
         if snap:
-            await websocket.send_text(
-                json.dumps({"type": "indicators", **_snapshot_to_dict(snap)})
-            )
+            payload = {"type": "indicators", **_snapshot_to_dict(snap)}
+            last = calculator.last_candle()
+            if last:
+                payload["candle"] = last.to_chart_bar()
+            await websocket.send_text(json.dumps(payload))
         if binance_ws.latest_price:
             await websocket.send_text(
                 json.dumps({"type": "price_tick", "price": binance_ws.latest_price})
@@ -1144,6 +1184,7 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
     try:
         snap_dict = _snapshot_to_dict(snapshot)
         snap_dict["type"] = "indicators"
+        snap_dict["candle"] = candle.to_chart_bar()
         await alert_manager.ws_broadcaster.broadcast(snap_dict)
     except Exception as exc:
         logger.error("Failed to broadcast indicators: %s", exc)
@@ -1770,6 +1811,18 @@ async def _persist_signal(signal: SignalResult) -> Optional[int]:
 
 
 # ── Serialisation helpers ─────────────────────────────────────────────────────
+
+
+def _price_row_to_chart_bar(row: PriceCandle) -> dict:
+    """Map a persisted 1m candle to the live-chart bar shape."""
+    return {
+        "time": int(row.open_time.timestamp()),
+        "open": float(row.open_price),
+        "high": float(row.high_price),
+        "low": float(row.low_price),
+        "close": float(row.close_price),
+        "volume": float(row.volume),
+    }
 
 
 def _snapshot_to_dict(snap: IndicatorSnapshot) -> dict:

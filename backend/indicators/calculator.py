@@ -36,6 +36,17 @@ class Candle:
     close: float
     volume: float
 
+    def to_chart_bar(self) -> dict:
+        """OHLC bar for the live chart API / WebSocket (unix seconds)."""
+        return {
+            "time": int(self.timestamp.timestamp()),
+            "open": float(self.open),
+            "high": float(self.high),
+            "low": float(self.low),
+            "close": float(self.close),
+            "volume": float(self.volume),
+        }
+
 
 @dataclass
 class IndicatorSnapshot:
@@ -120,6 +131,17 @@ class IndicatorCalculator:
     def candle_count(self) -> int:
         """Number of candles currently in the rolling window."""
         return len(self._buffer)
+
+    def recent_candles(self, limit: int = 200) -> list[Candle]:
+        """Oldest-to-newest slice of the rolling window (for the live chart)."""
+        if limit <= 0:
+            return []
+        buf = list(self._buffer)
+        return buf[-limit:] if len(buf) > limit else buf
+
+    def last_candle(self) -> Optional[Candle]:
+        """Most recent closed candle, or None if the buffer is empty."""
+        return self._buffer[-1] if self._buffer else None
 
     def reset(self) -> None:
         """Clear the rolling buffer and cached snapshot.

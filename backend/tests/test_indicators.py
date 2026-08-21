@@ -156,3 +156,27 @@ class TestIndicatorCalculatorResilience:
         calc = IndicatorCalculator(max_candles=50)
         _feed_candles(calc, 100)
         assert calc.candle_count() == 50
+
+    def test_recent_candles_empty(self):
+        calc = IndicatorCalculator()
+        assert calc.recent_candles() == []
+        assert calc.last_candle() is None
+
+    def test_recent_candles_limit_and_order(self):
+        calc = IndicatorCalculator()
+        _feed_candles(calc, 10, start_price=45_000.0)
+        bars = calc.recent_candles(3)
+        assert len(bars) == 3
+        assert bars[0].timestamp < bars[-1].timestamp
+        assert calc.last_candle() is not None
+        assert calc.last_candle().timestamp == bars[-1].timestamp
+
+    def test_candle_to_chart_bar_unix_seconds(self):
+        candle = _make_candle(45_000.0, ts_offset_min=0)
+        bar = candle.to_chart_bar()
+        assert bar["time"] == int(candle.timestamp.timestamp())
+        assert bar["open"] == candle.open
+        assert bar["high"] == candle.high
+        assert bar["low"] == candle.low
+        assert bar["close"] == candle.close
+        assert bar["volume"] == candle.volume

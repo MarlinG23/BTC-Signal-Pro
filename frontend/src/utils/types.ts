@@ -15,6 +15,16 @@ export type AlertType =
 
 export type Sentiment = "BULLISH" | "BEARISH" | "NEUTRAL";
 
+/** Closed 1-minute OHLCV bar for the live chart (unix seconds). */
+export interface CandleBar {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume?: number;
+}
+
 export interface IndicatorSnapshot {
   timestamp: string | null;
   close_price: number | null;

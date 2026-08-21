@@ -5,9 +5,10 @@
 
 import { useEffect, useState } from "react";
 import clsx from "clsx";
-import { Signal, SignalType, WaitSignal } from "../utils/types";
+import { Signal, WaitSignal } from "../utils/types";
 import { formatPrice, fmt, timeAgoSeconds } from "../utils/format";
 import { isSignalFresh } from "../utils/signalFreshness";
+import { computeLiveLevels } from "../utils/liveLevels";
 import { TrendLabel } from "../utils/trend";
 import { resolveIdleReason } from "../utils/idleReason";
 import {
@@ -25,30 +26,6 @@ interface SignalBadgeProps {
   currentPrice: number | null;
   atr14: number | null;
   fearGreed: number | null;
-}
-
-function computeLiveLevels(
-  currentPrice: number,
-  atr14: number | null,
-  signalType: SignalType,
-  tpMultiplier = 1,
-  slMultiplier = 1
-): { tp: number; sl: number; rr: number } | null {
-  if (signalType === "HOLD") return null;
-
-  const minTpDist = currentPrice * 0.005;
-  const minSlDist = currentPrice * 0.003;
-  const tpFromAtr = atr14 != null && atr14 > 0 ? atr14 * 2 : 0;
-  const slFromAtr = atr14 != null && atr14 > 0 ? atr14 * 1 : 0;
-  const tpDist = Math.max(tpFromAtr, minTpDist) * tpMultiplier;
-  const slDist = Math.max(slFromAtr, minSlDist) * slMultiplier;
-
-  const isLong = signalType === "BUY" || signalType === "STRONG_BUY";
-  const tp = isLong ? currentPrice + tpDist : currentPrice - tpDist;
-  const sl = isLong ? currentPrice - slDist : currentPrice + slDist;
-  const rr = slDist > 0 ? tpDist / slDist : 0;
-
-  return { tp, sl, rr };
 }
 
 const DISPLAY_CONFIG: Record<

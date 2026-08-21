@@ -19,6 +19,7 @@ import { useApi } from "../hooks/useApi";
 import {
   AlertItem,
   BacktestResult,
+  CandleBar,
   FearGreedData,
   IndicatorSnapshot,
   NewsItem,
@@ -36,6 +37,7 @@ const API_BASE = import.meta.env.VITE_API_URL || "";
 export interface LiveDataValue {
   livePrice: number | null;
   candleCount: number;
+  latestClosedCandle: CandleBar | null;
   indicators: IndicatorSnapshot | null;
   snap4h: Snapshot4H | null;
   snap4hLoading: boolean;
@@ -70,6 +72,8 @@ export function useLiveData(): LiveDataValue {
 export function LiveDataProvider({ children }: { children: ReactNode }) {
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [candleCount, setCandleCount] = useState(0);
+  const [latestClosedCandle, setLatestClosedCandle] =
+    useState<CandleBar | null>(null);
   const [indicators, setIndicators] = useState<IndicatorSnapshot | null>(null);
   const [latestSignal, setLatestSignal] = useState<Signal | null>(null);
   const [latestWait, setLatestWait] = useState<WaitSignal | null>(null);
@@ -118,8 +122,14 @@ export function LiveDataProvider({ children }: { children: ReactNode }) {
         break;
 
       case "indicators": {
-        const snap = msg as unknown as IndicatorSnapshot & { type: string };
+        const snap = msg as unknown as IndicatorSnapshot & {
+          type: string;
+          candle?: CandleBar;
+        };
         setIndicators(snap);
+        if (snap.candle && typeof snap.candle.time === "number") {
+          setLatestClosedCandle(snap.candle);
+        }
         if (snap.close_price) {
           setLivePrice(snap.close_price);
           setCandleCount((c) => c + 1);
@@ -287,6 +297,7 @@ export function LiveDataProvider({ children }: { children: ReactNode }) {
     () => ({
       livePrice,
       candleCount,
+      latestClosedCandle,
       indicators,
       snap4h: snap4h ?? null,
       snap4hLoading: snap4hLoading && !snap4h,
@@ -310,6 +321,7 @@ export function LiveDataProvider({ children }: { children: ReactNode }) {
     [
       livePrice,
       candleCount,
+      latestClosedCandle,
       indicators,
       snap4h,
       snap4hLoading,

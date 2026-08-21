@@ -7,6 +7,7 @@ import { SignalBadge } from "../components/SignalBadge";
 import { TrendPanel } from "../components/TrendPanel";
 import { MtfConfluencePanel } from "../components/MtfConfluencePanel";
 import { FearGreedGauge } from "../components/FearGreedGauge";
+import { LiveChart } from "../components/LiveChart";
 
 export function LivePage() {
   const {
@@ -40,6 +41,7 @@ export function LivePage() {
       </div>
       <div className="space-y-4">
         <FearGreedGauge data={fearGreed} compact />
+        <LiveChart />
       </div>
     </div>
   );
