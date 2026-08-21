@@ -21,13 +21,17 @@ function getColor(value: number): string {
   return "#00ff88";                        // Extreme Greed
 }
 
-function getArcPath(value: number): string {
-  // SVG arc from 180° to 0° (left to right), covering the range 0–100
+export function getArcPath(value: number): string {
+  // Semicircle from left (180°) to right (0°). Sweep is always ≤ 180°,
+  // so large-arc MUST stay 0. Using 1 for values > 50 took the long way
+  // around the circle; the bottom half sits outside the viewBox and the
+  // stroke collapsed into two disconnected caps.
+  const clamped = Math.min(100, Math.max(0, value));
   const cx = 60;
   const cy = 60;
   const r = 50;
   const startAngle = 180;
-  const endAngle = 180 - (value / 100) * 180;
+  const endAngle = 180 - (clamped / 100) * 180;
 
   const toRad = (deg: number) => (deg * Math.PI) / 180;
   const x1 = cx + r * Math.cos(toRad(startAngle));
@@ -35,8 +39,7 @@ function getArcPath(value: number): string {
   const x2 = cx + r * Math.cos(toRad(endAngle));
   const y2 = cy - r * Math.sin(toRad(endAngle));
 
-  const largeArc = value > 50 ? 1 : 0;
-  return `M ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2}`;
+  return `M ${x1.toFixed(3)} ${y1.toFixed(3)} A ${r} ${r} 0 0 1 ${x2.toFixed(3)} ${y2.toFixed(3)}`;
 }
 
 export function FearGreedGauge({ data, compact = false }: FearGreedGaugeProps) {
@@ -57,6 +60,7 @@ export function FearGreedGauge({ data, compact = false }: FearGreedGaugeProps) {
           <svg
             viewBox="0 0 120 70"
             className={compact ? "w-28 h-16" : "w-40 h-24"}
+            overflow="visible"
           >
             {/* Background track */}
             <path
@@ -66,14 +70,16 @@ export function FearGreedGauge({ data, compact = false }: FearGreedGaugeProps) {
               strokeWidth="10"
               strokeLinecap="round"
             />
-            {/* Value arc */}
-            <path
-              d={getArcPath(data.value)}
-              fill="none"
-              stroke={getColor(data.value)}
-              strokeWidth="10"
-              strokeLinecap="round"
-            />
+            {/* Value arc — skip 0 so we don't draw a degenerate dot */}
+            {data.value > 0 && (
+              <path
+                d={getArcPath(data.value)}
+                fill="none"
+                stroke={getColor(data.value)}
+                strokeWidth="10"
+                strokeLinecap="round"
+              />
+            )}
             {/* Center value */}
             <text
               x="60"
