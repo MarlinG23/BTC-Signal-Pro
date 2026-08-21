@@ -6,6 +6,7 @@ import clsx from "clsx";
 import { Signal, SignalType } from "../utils/types";
 import { formatPrice, fmt, timeAgo } from "../utils/format";
 import { useApi } from "../hooks/useApi";
+import { formatOutcome } from "../utils/riskTier";
 
 interface SignalHistoryProps {
   signals: Signal[];
@@ -18,6 +19,17 @@ interface SignalStats {
   open: number;
   win_rate_pct: number;
   avg_pnl_pct: number;
+  by_tier?: Record<
+    string,
+    {
+      tier: number;
+      count: number;
+      wins: number;
+      losses: number;
+      open: number;
+      win_rate_pct: number;
+    }
+  >;
 }
 
 const TYPE_STYLES: Record<SignalType, string> = {
@@ -79,6 +91,27 @@ export function SignalHistory({ signals, loading }: SignalHistoryProps) {
         )}
       </div>
 
+      {stats?.by_tier && Object.keys(stats.by_tier).length > 0 && (
+        <div className="flex flex-wrap gap-2 mb-4 text-xs text-brand-muted">
+          {["1", "2", "3"].map((key) => {
+            const bucket = stats.by_tier?.[key];
+            if (!bucket) return null;
+            return (
+              <span
+                key={key}
+                className="rounded border border-brand-border px-2 py-1"
+              >
+                T{key}: {bucket.wins}W/{bucket.losses}L
+                {bucket.wins + bucket.losses > 0
+                  ? ` · ${bucket.win_rate_pct}%`
+                  : ""}
+                {bucket.open ? ` · ${bucket.open} open` : ""}
+              </span>
+            );
+          })}
+        </div>
+      )}
+
       {loading ? (
         <div className="flex items-center justify-center py-6 text-brand-muted text-sm">
           Loading…
@@ -93,6 +126,8 @@ export function SignalHistory({ signals, loading }: SignalHistoryProps) {
             <thead>
               <tr className="text-brand-muted text-xs uppercase tracking-wider border-b border-brand-border">
                 <th className="text-left pb-2 pr-4">Signal</th>
+                <th className="text-right pb-2 pr-4">Tier</th>
+                <th className="text-right pb-2 pr-4">RSI 4H</th>
                 <th className="text-right pb-2 pr-4">Conf%</th>
                 <th className="text-right pb-2 pr-4">Entry</th>
                 <th className="text-right pb-2 pr-4">TP</th>
@@ -119,6 +154,12 @@ export function SignalHistory({ signals, loading }: SignalHistoryProps) {
                     </span>
                   </td>
                   <td className="text-right pr-4 font-mono">
+                    {s.risk_tier != null ? `T${s.risk_tier}` : "—"}
+                  </td>
+                  <td className="text-right pr-4 font-mono">
+                    {s.rsi_4h != null ? s.rsi_4h.toFixed(1) : "—"}
+                  </td>
+                  <td className="text-right pr-4 font-mono">
                     {s.confidence.toFixed(1)}%
                   </td>
                   <td className="text-right pr-4 font-mono text-white">
@@ -136,7 +177,7 @@ export function SignalHistory({ signals, loading }: SignalHistoryProps) {
                   <td className="text-right pr-4">
                     {s.outcome ? (
                       <span className={clsx("text-xs", OUTCOME_STYLES[s.outcome] ?? "text-brand-muted")}>
-                        {s.outcome}
+                        {formatOutcome(s.outcome)}
                         {s.pnl_percent != null && (
                           <span className="ml-1 font-mono">
                             ({s.pnl_percent > 0 ? "+" : ""}{s.pnl_percent.toFixed(2)}%)
@@ -144,7 +185,7 @@ export function SignalHistory({ signals, loading }: SignalHistoryProps) {
                         )}
                       </span>
                     ) : (
-                      <span className="text-xs text-brand-muted">pending</span>
+                      <span className="text-xs text-brand-muted">still open</span>
                     )}
                   </td>
                   <td className="text-right text-brand-muted text-xs whitespace-nowrap">

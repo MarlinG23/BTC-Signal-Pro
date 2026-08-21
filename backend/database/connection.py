@@ -82,17 +82,24 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """
-    Create all tables that don't already exist.
-
-    Called once during application startup.  In production you should
-    run Alembic migrations instead, but this is kept as a convenience
-    for initial setup and CI environments.
+    Create all tables that don't already exist, then add any new columns
+    on existing production tables (create_all will not ALTER).
     """
+    from sqlalchemy import text
+
     from database.models import Base  # local import avoids circular imports
 
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            for stmt in (
+                "ALTER TABLE signals ADD COLUMN IF NOT EXISTS risk_tier INTEGER",
+                "ALTER TABLE signals ADD COLUMN IF NOT EXISTS rsi_4h DOUBLE PRECISION",
+                "ALTER TABLE signals ADD COLUMN IF NOT EXISTS size_multiplier DOUBLE PRECISION",
+                "ALTER TABLE signals ADD COLUMN IF NOT EXISTS tp_multiplier DOUBLE PRECISION",
+                "ALTER TABLE signals ADD COLUMN IF NOT EXISTS sl_multiplier DOUBLE PRECISION",
+            ):
+                await conn.execute(text(stmt))
         logger.info("Database tables verified / created successfully.")
     except Exception as exc:
         logger.error("Failed to initialise database: %s", exc)

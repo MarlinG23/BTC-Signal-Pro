@@ -38,6 +38,7 @@ from news.sentiment import SentimentAnalyzer
 from signals.backtester import BacktestEngine, BacktestOptions
 from signals.engine import SignalEngine, SignalResult
 from signals.param_sweep import run_param_sweep, run_quality_sweep
+from signals.risk_tier import attach_risk_tier
 from signals.trend import trend_direction_from_snapshot
 
 logging.basicConfig(
@@ -401,6 +402,34 @@ async def get_signal_stats(db: AsyncSession = Depends(get_db)):
             stats["win_rate_pct"] = round(stats["wins"] / decided * 100, 1)
         if pnl_count > 0:
             stats["avg_pnl_pct"] = round(total_pnl / pnl_count, 2)
+
+        tier_result = await db.execute(
+            select(
+                Signal.risk_tier,
+                Signal.outcome,
+                sqlfunc.count(Signal.id).label("count"),
+            )
+            .where(Signal.risk_tier.isnot(None))
+            .group_by(Signal.risk_tier, Signal.outcome)
+        )
+        by_tier: dict = {}
+        for risk_tier, outcome, count in tier_result.all():
+            key = str(risk_tier)
+            bucket = by_tier.setdefault(
+                key, {"tier": risk_tier, "count": 0, "wins": 0, "losses": 0, "open": 0, "win_rate_pct": 0.0}
+            )
+            bucket["count"] += count
+            if outcome == "WIN":
+                bucket["wins"] += count
+            elif outcome == "LOSS":
+                bucket["losses"] += count
+            elif outcome == "OPEN":
+                bucket["open"] += count
+        for bucket in by_tier.values():
+            decided_t = bucket["wins"] + bucket["losses"]
+            if decided_t > 0:
+                bucket["win_rate_pct"] = round(bucket["wins"] / decided_t * 100, 1)
+        stats["by_tier"] = by_tier
 
         return stats
     except Exception as exc:
@@ -1127,6 +1156,18 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
     signal = signal_engine.evaluate(snapshot, candle_count=calculator.candle_count())
 
     if signal:
+        snap_4h = calculator_4h.get_snapshot()
+        rsi_4h = snap_4h.rsi_14 if snap_4h else None
+        tier = attach_risk_tier(signal, rsi_4h)
+        logger.info(
+            "Risk tier: T%d RSI_4H=%s size=%.0f%% tp_x=%.2f sl_x=%.2f",
+            tier.tier,
+            f"{rsi_4h:.1f}" if rsi_4h is not None else "n/a",
+            tier.size_multiplier * 100,
+            tier.tp_multiplier,
+            tier.sl_multiplier,
+        )
+
         signal_is_bullish = signal.signal_type.value in ("BUY", "STRONG_BUY")
         signal_is_bearish = signal.signal_type.value in ("SELL", "STRONG_SELL")
 
@@ -1165,8 +1206,10 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
             }
             await alert_manager.ws_broadcaster.broadcast(sig_dict)
             logger.info(
-                "Signal fired: %s conf=%.1f%% 4H_trend=%+d F&G=%s MTF=%d/%d",
-                signal.signal_type.value, signal.confidence, trend, fg_value,
+                "Signal fired: %s T%d conf=%.1f%% 4H_trend=%+d RSI_4H=%s F&G=%s MTF=%d/%d",
+                signal.signal_type.value, signal.risk_tier or 1, signal.confidence, trend,
+                f"{rsi_4h:.1f}" if rsi_4h is not None else "n/a",
+                fg_value,
                 mtf_agree, len(MTF_TIMEFRAMES),
             )
         else:
@@ -1709,6 +1752,11 @@ async def _persist_signal(signal: SignalResult) -> Optional[int]:
                 risk_reward_ratio=signal.risk_reward_ratio,
                 indicators_agreed=signal.indicators_agreed,
                 indicator_details=signal.indicator_details,
+                risk_tier=signal.risk_tier,
+                rsi_4h=signal.rsi_4h,
+                size_multiplier=signal.size_multiplier,
+                tp_multiplier=signal.tp_multiplier,
+                sl_multiplier=signal.sl_multiplier,
             )
             session.add(db_signal)
             await session.flush()
@@ -1758,6 +1806,11 @@ def _signal_to_dict(s: Signal) -> dict:
         "generated_at": s.generated_at.isoformat(),
         "outcome": s.outcome,
         "pnl_percent": s.pnl_percent,
+        "risk_tier": s.risk_tier,
+        "rsi_4h": round(s.rsi_4h, 2) if s.rsi_4h is not None else None,
+        "size_multiplier": s.size_multiplier,
+        "tp_multiplier": s.tp_multiplier,
+        "sl_multiplier": s.sl_multiplier,
     }
 
 

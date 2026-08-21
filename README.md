@@ -96,6 +96,7 @@ A signal fires when:
 3. **4H trend confirms** the 1M entry — BUY when price > EMA20 > EMA50, SELL when price < EMA20 < EMA50 (overbought RSI does **not** veto a bull run)
 4. **≥ 1 MTF timeframe** (15m/30m/1h/2h) agrees, using the same EMA-stack rule
 5. **Fear & Greed is context only** — greed does not block BUY; fear does not block SELL
+6. **BUY risk tier from 4H RSI** — still fires; size/TP/SL tighten as RSI extends (T1 <70, T2 70–85, T3 ≥85)
 
 | Signal Type | Indicators Agreed | Confidence |
 |-------------|-------------------|------------|

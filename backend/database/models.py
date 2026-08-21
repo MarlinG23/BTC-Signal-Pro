@@ -150,6 +150,13 @@ class Signal(Base):
     outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     pnl_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
+    # Risk tier at entry (4H RSI). Null on rows created before this column existed.
+    risk_tier: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    rsi_4h: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    size_multiplier: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    tp_multiplier: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    sl_multiplier: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     alerts: Mapped[list["Alert"]] = relationship("Alert", back_populates="signal")
 
     def __repr__(self) -> str:

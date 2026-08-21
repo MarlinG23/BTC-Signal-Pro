@@ -78,7 +78,7 @@ export function LiveDataProvider({ children }: { children: ReactNode }) {
   const [liveNews, setLiveNews] = useState<NewsItem[]>([]);
 
   const { data: historicalSignals, loading: signalsLoading } = useApi<Signal[]>(
-    "/api/signals/latest?limit=20",
+    "/api/signals/latest?limit=50",
     30_000
   );
   const { data: historicalNews, loading: newsLoading } = useApi<NewsItem[]>(

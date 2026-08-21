@@ -58,6 +58,11 @@ class SignalResult:
     indicators_agreed: int
     indicator_details: str  # JSON string of IndicatorVote list
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    risk_tier: Optional[int] = None
+    rsi_4h: Optional[float] = None
+    size_multiplier: Optional[float] = None
+    tp_multiplier: Optional[float] = None
+    sl_multiplier: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
@@ -69,6 +74,11 @@ class SignalResult:
             "risk_reward_ratio": self.risk_reward_ratio,
             "indicators_agreed": self.indicators_agreed,
             "generated_at": self.generated_at.isoformat(),
+            "risk_tier": self.risk_tier,
+            "rsi_4h": round(self.rsi_4h, 2) if self.rsi_4h is not None else None,
+            "size_multiplier": self.size_multiplier,
+            "tp_multiplier": self.tp_multiplier,
+            "sl_multiplier": self.sl_multiplier,
         }
 
 

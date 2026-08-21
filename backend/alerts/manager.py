@@ -211,8 +211,15 @@ class AlertManager:
             "STRONG_SELL": "💥",
         }.get(signal_result.signal_type.value, "📊")
 
+        tier_bit = ""
+        if getattr(signal_result, "risk_tier", None):
+            rsi = getattr(signal_result, "rsi_4h", None)
+            rsi_txt = f" RSI {rsi:.1f}" if rsi is not None else ""
+            size_pct = int((signal_result.size_multiplier or 1) * 100)
+            tier_bit = f" T{signal_result.risk_tier}{rsi_txt} size {size_pct}%"
+
         msg = (
-            f"{signal_result.signal_type.value} signal — "
+            f"{signal_result.signal_type.value}{tier_bit} signal — "
             f"confidence {signal_result.confidence:.1f}% | "
             f"entry ${signal_result.entry_price:,.2f}"
         )
@@ -226,6 +233,9 @@ class AlertManager:
                 "entry_price": str(signal_result.entry_price),
                 "take_profit": str(signal_result.take_profit or ""),
                 "stop_loss": str(signal_result.stop_loss or ""),
+                "risk_tier": str(getattr(signal_result, "risk_tier", "") or ""),
+                "rsi_4h": str(getattr(signal_result, "rsi_4h", "") or ""),
+                "size_multiplier": str(getattr(signal_result, "size_multiplier", "") or ""),
             },
         )
 

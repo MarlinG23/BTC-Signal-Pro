@@ -16,6 +16,7 @@ import {
   resolveDisplayState,
   resolveTradeReadyStatus,
 } from "../utils/signalDisplay";
+import { tierHeadline, tierSizeHint } from "../utils/riskTier";
 
 interface SignalBadgeProps {
   signal: Signal | null;
@@ -29,7 +30,9 @@ interface SignalBadgeProps {
 function computeLiveLevels(
   currentPrice: number,
   atr14: number | null,
-  signalType: SignalType
+  signalType: SignalType,
+  tpMultiplier = 1,
+  slMultiplier = 1
 ): { tp: number; sl: number; rr: number } | null {
   if (signalType === "HOLD") return null;
 
@@ -37,8 +40,8 @@ function computeLiveLevels(
   const minSlDist = currentPrice * 0.003;
   const tpFromAtr = atr14 != null && atr14 > 0 ? atr14 * 2 : 0;
   const slFromAtr = atr14 != null && atr14 > 0 ? atr14 * 1 : 0;
-  const tpDist = Math.max(tpFromAtr, minTpDist);
-  const slDist = Math.max(slFromAtr, minSlDist);
+  const tpDist = Math.max(tpFromAtr, minTpDist) * tpMultiplier;
+  const slDist = Math.max(slFromAtr, minSlDist) * slMultiplier;
 
   const isLong = signalType === "BUY" || signalType === "STRONG_BUY";
   const tp = isLong ? currentPrice + tpDist : currentPrice - tpDist;
@@ -130,6 +133,11 @@ export function SignalBadge({
         risk_reward_ratio: waitSignal!.risk_reward_ratio,
         indicators_agreed: waitSignal!.indicators_agreed,
         generated_at: waitSignal!.generated_at,
+        risk_tier: waitSignal!.risk_tier,
+        rsi_4h: waitSignal!.rsi_4h,
+        size_multiplier: waitSignal!.size_multiplier,
+        tp_multiplier: waitSignal!.tp_multiplier,
+        sl_multiplier: waitSignal!.sl_multiplier,
       };
 
   const displayState: DisplaySignalType = freshFired
@@ -156,13 +164,24 @@ export function SignalBadge({
   const liveEntry = currentPrice ?? entrySignal.entry_price;
   const liveLevels =
     liveEntry != null && showLevels
-      ? computeLiveLevels(liveEntry, atr14, levelType)
+      ? computeLiveLevels(
+          liveEntry,
+          atr14,
+          levelType,
+          entrySignal.tp_multiplier ?? 1,
+          entrySignal.sl_multiplier ?? 1
+        )
       : null;
   const displayTp = liveLevels?.tp ?? entrySignal.take_profit;
   const displaySl = liveLevels?.sl ?? entrySignal.stop_loss;
   const displayRr = liveLevels?.rr ?? entrySignal.risk_reward_ratio;
   const usingLivePrice =
     currentPrice != null && currentPrice !== entrySignal.entry_price;
+  const showTier =
+    isActionable &&
+    entrySignal.risk_tier != null &&
+    (entrySignal.signal_type === "BUY" ||
+      entrySignal.signal_type === "STRONG_BUY");
 
   return (
     <div className="space-y-2">
@@ -180,6 +199,25 @@ export function SignalBadge({
             <div className={clsx("text-3xl font-bold tracking-widest", config.colorClass)}>
               {config.label}
             </div>
+            {showTier && (
+              <div
+                className={clsx(
+                  "mt-2 text-sm font-semibold",
+                  entrySignal.risk_tier === 3
+                    ? "text-orange-400"
+                    : entrySignal.risk_tier === 2
+                    ? "text-yellow-400"
+                    : "text-brand-green"
+                )}
+              >
+                {tierHeadline(entrySignal.risk_tier!, entrySignal.rsi_4h)}
+              </div>
+            )}
+            {showTier && (
+              <div className="text-brand-muted text-xs mt-0.5">
+                {tierSizeHint(entrySignal.size_multiplier)}
+              </div>
+            )}
             <div className="text-brand-muted text-sm mt-1">
               {entrySignal.confidence.toFixed(1)}% confidence ·{" "}
               {entrySignal.indicators_agreed} indicators agreed

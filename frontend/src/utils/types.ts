@@ -48,6 +48,11 @@ export interface Signal {
   generated_at: string;
   outcome?: "WIN" | "LOSS" | "OPEN" | null;
   pnl_percent?: number | null;
+  risk_tier?: number | null;
+  rsi_4h?: number | null;
+  size_multiplier?: number | null;
+  tp_multiplier?: number | null;
+  sl_multiplier?: number | null;
 }
 
 /** Blocked 1M entry broadcast over WebSocket — not persisted to DB. */
@@ -65,6 +70,11 @@ export interface WaitSignal {
   trend_4h?: number;
   fear_greed?: number | null;
   mtf_agreement?: number;
+  risk_tier?: number | null;
+  rsi_4h?: number | null;
+  size_multiplier?: number | null;
+  tp_multiplier?: number | null;
+  sl_multiplier?: number | null;
 }
 
 /** One multi-timeframe confluence interval (15m/30m/1h/2h) — GET /api/indicators/mtf */
