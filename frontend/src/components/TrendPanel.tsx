@@ -124,11 +124,11 @@ export function TrendPanel({
         >
           4H: {trend.label}
         </div>
-        <div className="text-xs px-2 py-1 rounded border border-brand-border text-brand-muted">
-          BUY gate: F&amp;G &lt; 40
+        <div className="text-xs px-2 py-1 rounded border border-brand-green/40 text-brand-green">
+          Trend-following: BUY with 4H bull, SELL with 4H bear
         </div>
         <div className="text-xs px-2 py-1 rounded border border-brand-border text-brand-muted">
-          SELL gate: F&amp;G &gt; 60
+          F&amp;G is context only
         </div>
         {snap4h?.candles_buffered != null && (
           <div className="text-xs px-2 py-1 rounded border border-brand-border text-brand-muted ml-auto">

@@ -68,13 +68,11 @@ export function displayToLevelType(
 export type TradeReadyStatus = "ready" | "waiting_4h" | "not_met";
 
 function fearGreedAllows(
-  display: DisplaySignalType,
-  fearGreed: number | null
+  _display: DisplaySignalType,
+  _fearGreed: number | null
 ): boolean {
-  if (fearGreed == null) return true;
-  if (display === "BUY") return fearGreed < 40;
-  if (display === "SELL") return fearGreed > 60;
-  return false;
+  // F&G is shown on the dashboard but does not block live trades.
+  return true;
 }
 
 /** Evaluate whether all four trade conditions are satisfied. */

@@ -93,8 +93,9 @@ pytest
 A signal fires when:
 1. **≥ 3 technical indicators agree** on direction (bullish/bearish)
 2. **Weighted confidence score ≥ 70%** (`SIGNAL_CONFIDENCE_THRESHOLD`)
-3. **4H trend confirms** the 1M entry direction
-4. **Fear & Greed filter** — BUY when F&G < 40, SELL when F&G > 60
+3. **4H trend confirms** the 1M entry — BUY when price > EMA20 > EMA50, SELL when price < EMA20 < EMA50 (overbought RSI does **not** veto a bull run)
+4. **≥ 1 MTF timeframe** (15m/30m/1h/2h) agrees, using the same EMA-stack rule
+5. **Fear & Greed is context only** — greed does not block BUY; fear does not block SELL
 
 | Signal Type | Indicators Agreed | Confidence |
 |-------------|-------------------|------------|

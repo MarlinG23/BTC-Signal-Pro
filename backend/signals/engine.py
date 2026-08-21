@@ -197,26 +197,41 @@ class SignalEngine:
 
         return votes
 
+    def _ema_stack(self, snap: IndicatorSnapshot) -> int:
+        """+1 uptrend, -1 downtrend, 0 mixed — same EMA stack as the 4H gate."""
+        if None in (snap.close_price, snap.ema_20, snap.ema_50):
+            return 0
+        if snap.close_price > snap.ema_20 > snap.ema_50:
+            return +1
+        if snap.close_price < snap.ema_20 < snap.ema_50:
+            return -1
+        return 0
+
     def _vote_rsi(self, snap: IndicatorSnapshot) -> Optional[IndicatorVote]:
         """
-        RSI thresholds:
-          < 30  → oversold  (strong bullish)
-          30–40 → recovering (mild bullish)
-          60–70 → approaching overbought (mild bearish)
-          > 70  → overbought (strong bearish)
-          else  → neutral
+        RSI: oversold/overbought votes are skipped when they fight the EMA stack
+        so a bull run is not sold just because RSI is extended.
         """
         if snap.rsi_14 is None:
             return None
 
         rsi = snap.rsi_14
+        stack = self._ema_stack(snap)
         if rsi < 25:
+            if stack == -1:
+                return IndicatorVote("rsi", 0, self.WEIGHTS["rsi"], f"RSI={rsi:.1f} oversold but EMA downtrend — not a buy")
             return IndicatorVote("rsi", +1, self.WEIGHTS["rsi"] * 1.5, f"RSI={rsi:.1f} extremely oversold")
         if rsi < 35:
+            if stack == -1:
+                return IndicatorVote("rsi", 0, self.WEIGHTS["rsi"], f"RSI={rsi:.1f} oversold but EMA downtrend — not a buy")
             return IndicatorVote("rsi", +1, self.WEIGHTS["rsi"], f"RSI={rsi:.1f} oversold")
         if rsi > 75:
+            if stack == +1:
+                return IndicatorVote("rsi", 0, self.WEIGHTS["rsi"], f"RSI={rsi:.1f} overbought but EMA uptrend — not a sell")
             return IndicatorVote("rsi", -1, self.WEIGHTS["rsi"] * 1.5, f"RSI={rsi:.1f} extremely overbought")
         if rsi > 65:
+            if stack == +1:
+                return IndicatorVote("rsi", 0, self.WEIGHTS["rsi"], f"RSI={rsi:.1f} extended but EMA uptrend — not a sell")
             return IndicatorVote("rsi", -1, self.WEIGHTS["rsi"], f"RSI={rsi:.1f} overbought")
         return IndicatorVote("rsi", 0, self.WEIGHTS["rsi"], f"RSI={rsi:.1f} neutral")
 
@@ -302,16 +317,29 @@ class SignalEngine:
             return None
 
         pb = snap.bb_percent_b
+        stack = self._ema_stack(snap)
         if pb < 0.05:
+            if stack == -1:
+                return IndicatorVote("bollinger", 0, self.WEIGHTS["bollinger"],
+                                     f"BB %B={pb:.2f} oversold but EMA downtrend — not a buy")
             return IndicatorVote("bollinger", +1, self.WEIGHTS["bollinger"] * 1.3,
                                  f"BB %B={pb:.2f} — price at/below lower band (oversold)")
         if pb < 0.20:
+            if stack == -1:
+                return IndicatorVote("bollinger", 0, self.WEIGHTS["bollinger"],
+                                     f"BB %B={pb:.2f} low-band but EMA downtrend — not a buy")
             return IndicatorVote("bollinger", +1, self.WEIGHTS["bollinger"],
                                  f"BB %B={pb:.2f} — approaching lower band")
         if pb > 0.95:
+            if stack == +1:
+                return IndicatorVote("bollinger", 0, self.WEIGHTS["bollinger"],
+                                     f"BB %B={pb:.2f} riding upper band in EMA uptrend — not a sell")
             return IndicatorVote("bollinger", -1, self.WEIGHTS["bollinger"] * 1.3,
                                  f"BB %B={pb:.2f} — price at/above upper band (overbought)")
         if pb > 0.80:
+            if stack == +1:
+                return IndicatorVote("bollinger", 0, self.WEIGHTS["bollinger"],
+                                     f"BB %B={pb:.2f} extended in EMA uptrend — not a sell")
             return IndicatorVote("bollinger", -1, self.WEIGHTS["bollinger"],
                                  f"BB %B={pb:.2f} — approaching upper band")
         return IndicatorVote("bollinger", 0, self.WEIGHTS["bollinger"],

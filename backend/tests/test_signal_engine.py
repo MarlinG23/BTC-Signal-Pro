@@ -158,6 +158,30 @@ class TestSignalEngineBullish:
         if result.risk_reward_ratio:
             assert result.risk_reward_ratio > 0
 
+    def test_melt_up_still_buys_when_rsi_and_bb_extended(self):
+        """Bull run: stacked EMAs + MACD; overbought RSI/BB must not flip to SELL."""
+        close = 75_000.0
+        snap = IndicatorSnapshot(
+            close_price=close,
+            rsi_14=72.0,
+            macd_line=60.0,
+            macd_signal=45.0,
+            macd_histogram=15.0,
+            ema_20=close * 0.998,
+            ema_50=close * 0.995,
+            ema_200=close * 0.990,
+            bb_upper=close + 400,
+            bb_middle=close,
+            bb_lower=close - 400,
+            bb_percent_b=0.88,
+            volume_sma_20=100.0,
+            volume_ratio=1.2,
+            atr_14=80.0,
+        )
+        result = SignalEngine().evaluate(snap)
+        assert result is not None
+        assert result.signal_type in (SignalType.BUY, SignalType.STRONG_BUY)
+
 
 class TestSignalEngineBearish:
     def test_bearish_snapshot_generates_sell_signal(self):

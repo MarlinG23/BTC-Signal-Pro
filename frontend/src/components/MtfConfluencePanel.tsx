@@ -1,10 +1,9 @@
 /**
  * Multi-timeframe confluence panel — shows the trend direction across
  * 15m/30m/1h/2h and how many agree with a hypothetical BUY or SELL right
- * now. Validated via backtest (30/60/90-day windows all positive) as an
- * additional filter layer on top of the 4H trend + Fear & Greed gates:
- * a signal only fires live if at least `min_agreement_required` of these
- * four timeframes agree with its direction.
+ * now. Extra filter on top of the 4H EMA-stack gate: a signal only fires
+ * live if at least `min_agreement_required` of these four timeframes
+ * agree with its direction.
  */
 
 import clsx from "clsx";

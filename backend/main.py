@@ -38,6 +38,7 @@ from news.sentiment import SentimentAnalyzer
 from signals.backtester import BacktestEngine, BacktestOptions
 from signals.engine import SignalEngine, SignalResult
 from signals.param_sweep import run_param_sweep, run_quality_sweep
+from signals.trend import trend_direction_from_snapshot
 
 logging.basicConfig(
     level=logging.DEBUG if not settings.is_production else logging.INFO,
@@ -1012,34 +1013,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 def _trend_direction_from_snapshot(snap: Optional[IndicatorSnapshot]) -> int:
-    """
-    Shared trend-direction rule used by the 4H gate AND every MTF confluence
-    timeframe (and mirrored in backend/signals/backtester.py + the
-    frontend's deriveTrend()) so "bullish"/"bearish" means the same thing
-    everywhere in the app.
-
-    Returns +1 (bullish), -1 (bearish), or 0 (neutral/insufficient data).
-
-      Bullish  (+1): price > EMA20 > EMA50  AND  RSI < 70
-      Bearish  (-1): price < EMA20 < EMA50  AND  RSI > 30
-      Neutral   (0): mixed or insufficient data
-    """
-    if snap is None or snap.close_price is None:
-        return 0
-
-    p = snap.close_price
-    e20 = snap.ema_20
-    e50 = snap.ema_50
-    rsi = snap.rsi_14
-
-    if None in (e20, e50):
-        return 0
-
-    if p > e20 > e50 and (rsi is None or rsi < 70):
-        return +1
-    if p < e20 < e50 and (rsi is None or rsi > 30):
-        return -1
-    return 0
+    """Delegate to the shared aggressive trend-following rule."""
+    return trend_direction_from_snapshot(snap)
 
 
 def _get_4h_trend_direction() -> int:
@@ -1155,34 +1130,20 @@ async def _on_candle_closed(candle: Candle, snapshot: IndicatorSnapshot) -> None
         signal_is_bullish = signal.signal_type.value in ("BUY", "STRONG_BUY")
         signal_is_bearish = signal.signal_type.value in ("SELL", "STRONG_SELL")
 
-        # Step 2: check 4H trend direction agrees with the 1M signal
+        # Step 2: 4H trend must agree — trade with the bull/bear run.
+        # Overbought RSI no longer vetoes a stacked EMA uptrend.
         trend = _get_4h_trend_direction()
         trend_confirms = (
             (signal_is_bullish and trend == +1) or
-            (signal_is_bearish and trend == -1) or
-            trend == 0  # no 4H data yet → don't block
+            (signal_is_bearish and trend == -1)
         )
 
-        # Step 3: Fear & Greed macro filter
-        #   BUY  signals only when F&G < 40 (fear zone — market oversold at macro level)
-        #   SELL signals only when F&G > 60 (greed zone — market overextended)
-        #   HOLD signals pass through always
+        # Step 3: Fear & Greed is context only. Greed is when a bull run
+        # pays; blocking BUY at F&G>=40 sat HOLD through the entire rally.
         fg_value = _latest_fear_greed.get("value") if _latest_fear_greed else None
         fg_allows = True
-        if fg_value is not None:
-            if signal_is_bullish and fg_value >= 40:
-                fg_allows = False
-                logger.info(
-                    "BUY signal blocked: Fear & Greed=%d (need < 40 for BUY)", fg_value
-                )
-            elif signal_is_bearish and fg_value <= 60:
-                fg_allows = False
-                logger.info(
-                    "SELL signal blocked: Fear & Greed=%d (need > 60 for SELL)", fg_value
-                )
 
-        # Step 4: multi-timeframe confluence — validated via backtest to
-        # reduce false entries the 4H+F&G gates alone let through.
+        # Step 4: multi-timeframe confluence (same EMA-stack rule as 4H).
         mtf_agree, mtf_trends = _get_mtf_agreement(signal_is_bullish, signal_is_bearish)
         mtf_confirms = mtf_agree >= MIN_MTF_AGREEMENT
         if not mtf_confirms:

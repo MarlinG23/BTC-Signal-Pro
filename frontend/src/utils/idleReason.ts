@@ -37,15 +37,17 @@ export function resolveIdleReason(
   const lines: string[] = [];
 
   if (trend4h === "BEARISH") {
-    lines.push("4H bearish — need bullish trend for BUY");
+    lines.push("4H bearish — looking for SELL entries");
   } else if (trend4h === "BULLISH") {
-    lines.push("4H bullish — need bearish trend for SELL");
+    lines.push("4H bullish — looking for BUY entries");
+  } else if (trend4h === "NEUTRAL") {
+    lines.push("4H mixed — waiting for EMA stack to confirm");
   }
 
-  if (fearGreed != null && fearGreed < 40) {
-    lines.push(`F&G ${fearGreed} — too low, SELL needs F&G > 60`);
-  } else if (fearGreed != null && fearGreed > 60) {
-    lines.push(`F&G ${fearGreed} — too high, BUY needs F&G < 40`);
+  if (fearGreed != null && fearGreed > 60) {
+    lines.push(`F&G ${fearGreed} greed (context only)`);
+  } else if (fearGreed != null && fearGreed < 40) {
+    lines.push(`F&G ${fearGreed} fear (context only)`);
   }
 
   if (lines.length > 0) {

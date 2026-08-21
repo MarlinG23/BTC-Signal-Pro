@@ -7,8 +7,8 @@ SignalEngine to measure real performance of the signal logic.
 Two run modes are supported when called from /api/backtest:
 
   1. 1M-only   — raw signal engine output with no gating (original behaviour).
-  2. Full pipeline — 1M signals filtered through the same 4H trend gate and
-                     Fear & Greed macro filter that govern live trades.
+  2. Full pipeline — 1M signals filtered through the 4H trend gate and
+                     optional MTF confluence (Fear & Greed is context only).
 
 Metrics computed (for each mode):
   - Total signals fired
@@ -36,6 +36,7 @@ import pandas as pd
 
 from indicators.calculator import Candle, IndicatorCalculator
 from signals.engine import SignalEngine, SignalResult, SignalType
+from signals.trend import trend_direction_from_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ class BacktestResult:
 
     The ``_1m`` fields reflect the raw signal engine with no gating
     (same as the original backtester).  The ``gated_*`` fields reflect
-    the full live pipeline (1M + 4H trend + Fear & Greed filter) and are
+    the live pipeline (1M + 4H trend + MTF) and are
     only populated when ``has_gated_run`` is True.
     """
 
@@ -114,7 +115,7 @@ class BacktestResult:
     skipped_while_in_position: int = 0  # signals ignored because a prior trade was still open (sequential_only)
     trades: list[Trade] = field(default_factory=list)
 
-    # ── Full pipeline (1M + 4H trend gate + F&G filter) ───────────────────
+    # ── Full pipeline (1M + 4H trend gate + MTF) ──────────────────────────
     has_gated_run: bool = False
     gated_total_signals: int = 0
     gated_total_trades: int = 0
@@ -203,9 +204,9 @@ class BacktestEngine:
       df_4h       — 4H OHLCV DataFrame for the same period (plus warmup).
                     When supplied the 4H trend gate is applied identically
                     to ``_get_4h_trend_direction()`` in main.py.
-      fg_history  — List of daily F&G dicts returned by
-                    NewsFetcher.fetch_fear_greed_historical().
-                    When supplied the Fear & Greed macro filter is applied.
+      fg_history  — Optional daily F&G history. Only applied when
+                    gate_mode is ``fg_only`` (research). Live/full mode
+                    does not block on Fear & Greed.
     """
 
     def __init__(self, max_hold_bars: int = DEFAULT_MAX_HOLD_BARS) -> None:
@@ -332,19 +333,20 @@ class BacktestEngine:
                 is_bearish = signal.signal_type.value in ("SELL", "STRONG_SELL")
 
                 apply_4h = opts.gate_mode in ("full", "4h_only") and trend_ts
-                apply_fg = opts.gate_mode in ("full", "fg_only") and fg_dates
+                apply_fg = opts.gate_mode == "fg_only" and fg_dates
 
                 if apply_4h:
                     trend = self._lookup_4h_trend(trend_ts, trend_timeline, signal_time)
                     trend_confirms = (
                         (is_bullish and trend == +1)
                         or (is_bearish and trend == -1)
-                        or trend == 0
                     )
                     if not trend_confirms:
                         blocked_trend += 1
                         continue
 
+                # F&G is research-only (`fg_only`). Live `full` mode follows
+                # 4H + MTF so bull-run BUY signals are not starved in greed.
                 if apply_fg:
                     fg_value = self._lookup_fg(fg_dates, fg_lookup, signal_time)
                     fg_allows = True
@@ -628,9 +630,8 @@ class BacktestEngine:
     ) -> tuple[dict, list]:
         """Replay OHLCV candles for any timeframe through a fresh
         IndicatorCalculator and record the trend direction at each closed
-        candle, using the same rule as the live 4H gate and the frontend's
-        deriveTrend(): price > EMA20 > EMA50 (+ RSI<70) = bullish,
-        price < EMA20 < EMA50 (+ RSI>30) = bearish, else neutral.
+        candle, using the shared aggressive rule: price > EMA20 > EMA50
+        = bullish, price < EMA20 < EMA50 = bearish, else neutral.
 
         Returns ``(trend_map, sorted_timestamps)`` where
         ``trend_map[ts] = +1 | 0 | -1`` and ``sorted_timestamps`` is the
@@ -649,14 +650,7 @@ class BacktestEngine:
                 volume=float(row["volume"]),
             )
             snap = calc.push_candle(candle)
-            trend = 0
-            if snap.close_price is not None and snap.ema_20 is not None and snap.ema_50 is not None:
-                p, e20, e50, rsi = snap.close_price, snap.ema_20, snap.ema_50, snap.rsi_14
-                if p > e20 > e50 and (rsi is None or rsi < 70):
-                    trend = +1
-                elif p < e20 < e50 and (rsi is None or rsi > 30):
-                    trend = -1
-            trend_map[timestamp] = trend
+            trend_map[timestamp] = trend_direction_from_snapshot(snap)
 
         sorted_ts = sorted(trend_map.keys())
         logger.info(
